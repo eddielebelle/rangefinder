@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import io
 
+from rangefinder.capture.scrub import Scrubber
+
 # Shares that are administrative / non-file — skip (a null session can't read them anyway).
 _SKIP_SHARES = {"IPC$", "ADMIN$", "PRINT$"}
 
@@ -35,6 +37,7 @@ def capture_smb(
     from impacket.smbconnection import SMBConnection
 
     warnings: list[str] = []
+    scrubber = Scrubber() if scrub else None
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)
@@ -50,7 +53,7 @@ def capture_smb(
 
             files: dict[str, str] = {}
             try:
-                _walk(conn, name, "", files, budget, max_file_size, scrub, warnings)
+                _walk(conn, name, "", files, budget, max_file_size, scrubber, warnings)
             except Exception as exc:  # access denied / not a disk share
                 warnings.append(f"share {name!r}: not fully readable at this access level ({exc})")
 
@@ -88,7 +91,7 @@ class _Budget:
         return self.used >= self.limit
 
 
-def _walk(conn, share, smb_dir, files, budget, max_size, scrub, warnings) -> None:
+def _walk(conn, share, smb_dir, files, budget, max_size, scrubber, warnings) -> None:
     pattern = (smb_dir + "*") if smb_dir else "*"
     for f in conn.listPath(share, pattern):
         name = f.get_longname()
@@ -97,7 +100,7 @@ def _walk(conn, share, smb_dir, files, budget, max_size, scrub, warnings) -> Non
         smb_path = smb_dir + name
         rel = smb_path.replace("\\", "/")
         if f.is_directory():
-            _walk(conn, share, smb_path + "\\", files, budget, max_size, scrub, warnings)
+            _walk(conn, share, smb_path + "\\", files, budget, max_size, scrubber, warnings)
             if budget.exhausted():
                 return
             continue
@@ -109,7 +112,7 @@ def _walk(conn, share, smb_dir, files, budget, max_size, scrub, warnings) -> Non
             files[rel] = f"<file omitted: {size} bytes exceeds capture limit>\n"
             continue
         data = _read(conn, share, smb_path)
-        files[rel] = _content(data, scrub)
+        files[rel] = _content(data, scrubber)
 
 
 def _read(conn, share, smb_path) -> bytes:
@@ -118,16 +121,12 @@ def _read(conn, share, smb_path) -> bytes:
     return buf.getvalue()
 
 
-def _content(data: bytes, scrub: bool) -> str:
+def _content(data: bytes, scrubber: Scrubber | None) -> str:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return f"<binary file, {len(data)} bytes; content not captured>\n"
-    if scrub:
-        from rangefinder.capture.http import _maybe_scrub
-
-        text = _maybe_scrub(text, True)
-    return text
+    return scrubber.text(text) if scrubber is not None else text
 
 
 def _cstr(value: str) -> str:

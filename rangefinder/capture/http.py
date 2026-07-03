@@ -19,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
+from rangefinder.capture.scrub import Scrubber, apply
+
 # Common interesting/sensitive paths worth probing beyond what crawling finds. This is a
 # discovery aid (where to look), NOT a misconfig catalog — whatever they return is captured
 # faithfully and only kept if it actually exists.
@@ -67,6 +69,7 @@ def capture_http(
 
     opener = _build_opener(insecure)
     warnings: list[str] = []
+    scrubber = Scrubber() if scrub else None
 
     # Seed probe set with the built-in list, then expand via the home page + robots.txt.
     to_probe: set[str] = set(_PROBE_PATHS)
@@ -99,17 +102,17 @@ def capture_http(
         # content of that endpoint is exactly what we want to reproduce.
         if resp.status == default_status and _text(resp.body) == default_body:
             continue
-        routes[path] = _route(resp, scrub)
+        routes[path] = _route(resp, scrubber)
 
     service: dict = {"type": "http", "port": port}
     if tls:
         service["tls"] = True
     if server_header:
-        service["server_header"] = _maybe_scrub(server_header, scrub)
+        service["server_header"] = apply(scrubber, server_header)
     if default_status != 404:
         service["default_status"] = default_status
     if default_body:
-        service["default_body"] = _maybe_scrub(default_body, scrub)[:_MAX_BODY]
+        service["default_body"] = apply(scrubber, default_body)[:_MAX_BODY]
     if routes:
         service["paths"] = routes
 
@@ -117,7 +120,7 @@ def capture_http(
     return service, warnings
 
 
-def _route(resp: _Resp, scrub: bool) -> dict:
+def _route(resp: _Resp, scrubber: Scrubber | None) -> dict:
     entry: dict = {}
     if resp.status != 200:
         entry["status"] = resp.status
@@ -125,13 +128,13 @@ def _route(resp: _Resp, scrub: bool) -> dict:
     for name, value in resp.headers.items():
         low = name.lower()
         if low in _KEEP_HEADERS and low != "content-type":
-            headers[name] = _maybe_scrub(value, scrub)
+            headers[name] = apply(scrubber, value)
     ctype = resp.headers.get("content-type")
     if ctype:
         entry["content_type"] = ctype
     text = _text(resp.body)
     if text is not None:
-        entry["body"] = _maybe_scrub(text, scrub)[:_MAX_BODY]
+        entry["body"] = apply(scrubber, text)[:_MAX_BODY]
     if headers:
         entry["headers"] = headers
     return entry
@@ -200,22 +203,3 @@ def _text(body: bytes | None) -> str | None:
         return body.decode("utf-8")
     except UnicodeDecodeError:
         return None  # binary body: route is kept (status/content-type), body omitted
-
-
-# ------------------------------------------------------------------------ scrubbing
-
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_SECRETY = re.compile(
-    r"(?i)(password|passwd|pwd|secret|api[_-]?key|token|authorization)"
-    r"(\s*[:=]\s*|\s*[\"']\s*:\s*[\"']?)([^\s\"'<>&,;]+)"
-)
-_LONGTOKEN = re.compile(r"\b(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{32,}={0,2}\b")
-
-
-def _maybe_scrub(text: str, scrub: bool) -> str:
-    if not scrub:
-        return text
-    text = _EMAIL.sub("user@example.invalid", text)
-    text = _SECRETY.sub(lambda m: m.group(1) + m.group(2) + "REDACTED", text)
-    text = _LONGTOKEN.sub("REDACTED", text)
-    return text

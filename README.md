@@ -145,9 +145,13 @@ Round-tripped end to end, nmap's `http-git` script flags the exposed repo on the
 just as it would on the original.
 
 **Verbatim by default, `--scrub` optional.** A capture holds real content, which is fine
-for a range owned by the org it mirrors; `--scrub` runs bodies/headers through a
-best-effort redactor (emails, tokens, `password=…`) so the config can leave the org —
-structure stays faithful, so the weakness still carries through.
+for a range owned by the org it mirrors; `--scrub` runs captured content (across all three
+captors) through a redactor that removes key/value secrets (`password=…`, connection
+strings), private keys, cloud/provider tokens (AWS, GitHub, Slack, …), JWTs, bearer/basic
+auth, URL credentials, and PII (emails, SSNs, Luhn-valid cards), and consistently
+pseudonymizes emails so references stay intact. Structure stays faithful, so the weakness
+still carries through. It is heuristic, not a guarantee — review before sharing (e.g. a
+password written in free prose with no `password=` marker won't be caught).
 
 `capture ldap` binds (anonymously by default), reads the RootDSE, and subtree-searches each
 naming context — recording the entries the directory actually returned. If anonymous bind

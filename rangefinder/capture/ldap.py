@@ -21,6 +21,8 @@ from pyasn1.codec.ber import decoder, encoder
 from pyasn1.error import PyAsn1Error
 from pyasn1_modules import rfc2251 as L
 
+from rangefinder.capture.scrub import Scrubber
+
 _ROOTDSE_ATTRS = [
     "*", "+", "namingContexts", "defaultNamingContext", "rootDomainNamingContext",
     "supportedLDAPVersion", "dnsHostName",
@@ -41,6 +43,7 @@ def capture_ldap(
 ) -> tuple[dict, list[str]]:
     """Bind, enumerate, and return (ldap_service_config, warnings)."""
     warnings: list[str] = []
+    scrubber = Scrubber() if scrub else None
     sock = socket.create_connection((host, port), timeout)
     try:
         if tls:
@@ -82,14 +85,14 @@ def capture_ldap(
     elif ncs:
         base_dn = ncs[0]
 
-    entries: list[dict] = [{"dn": "", "attributes": _clean(root_attrs, scrub)}]
+    entries: list[dict] = [{"dn": "", "attributes": _clean(root_attrs, scrubber)}]
     seen = {""}
     dropped = 0
     for dn, attrs in captured:
         if dn in seen:
             continue
         seen.add(dn)
-        cleaned = _clean(attrs, scrub)
+        cleaned = _clean(attrs, scrubber)
         if not cleaned and not attrs:
             dropped += 1
         entries.append({"dn": dn, "attributes": cleaned})
@@ -233,17 +236,13 @@ def _val(value) -> str | None:
 
 # --------------------------------------------------------------------------- scrubbing
 
-_from_http = None
 
-
-def _clean(attrs: dict, scrub: bool) -> dict:
-    if not scrub:
+def _clean(attrs: dict, scrubber: Scrubber | None) -> dict:
+    if scrubber is None:
         return {k: list(v) for k, v in attrs.items()}
-    from rangefinder.capture.http import _maybe_scrub
-
     out: dict[str, list[str]] = {}
     for name, vals in attrs.items():
         if name.lower() in _SENSITIVE_ATTRS:
             continue  # drop password-ish attributes entirely
-        out[name] = [_maybe_scrub(v, True) for v in vals]
+        out[name] = [scrubber.text(v) for v in vals]
     return out
