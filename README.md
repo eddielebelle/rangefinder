@@ -181,6 +181,7 @@ classes:
 ```bash
 rangefinder verify http http://10.0.0.30/           # per route: status + body + security headers
 rangefinder verify ldap 10.0.0.10 --bind-dn cn=admin,... --password …   # entry DNs + attribute sets
+rangefinder verify smb  10.0.0.20 --username … --password …   # share names + file tree + content
 ```
 
 ```
@@ -197,7 +198,12 @@ the real target is always re-fetched live (comparing the facade to its own captu
 would be a tautology), and fidelity is only claimed for the *perspective the capture
 exercised* (e.g. an anonymous bind — never a credentialed or deeper read it never saw).
 Exit code is non-zero on any divergence, so it gates in CI. Validated against genuine
-third-party software (nginx, OpenLDAP), not just against itself.
+third-party software (nginx, OpenLDAP, Samba), not just against itself.
+
+Equivalence is defined per protocol at the level the *tooling* cares about — e.g. SMB share
+and path names are compared case-insensitively because SMB itself is, so a replica that
+serves `PUBLIC` for a real `public` reads as faithful (a client reaches the same share
+either way) and the case normalisation is surfaced as a boundary note, not a false failure.
 
 ## Scoring
 

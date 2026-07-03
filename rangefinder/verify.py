@@ -21,7 +21,9 @@ claimed for the perspective the capture exercised (e.g. an anonymous bind).
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -56,14 +58,25 @@ class VerifyReport:
 # --------------------------------------------------------------- in-process facade server
 
 
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class _ServedFacade:
     """Serve one captured service dict as a live facade on 127.0.0.1:<ephemeral>.
 
-    Runs the facade's asyncio loop in a daemon thread so the (synchronous) probe clients can
-    hit it over a real socket, exactly as an external tool would.
+    Runs the facade's event loop in a daemon thread so the (synchronous) probe clients can
+    hit it over a real socket, exactly as an external tool would. The port is pre-picked
+    before start (rather than read back after) so this works for both the asyncio facades
+    and the impacket-threaded SMB facade, which binds its own listener.
     """
 
     def __init__(self, service: dict):
+        self.port = _free_port()
         cfg = RangeConfig.model_validate({
             "name": "verify",
             "network": {"subnet": "10.99.0.0/24"},
@@ -72,7 +85,6 @@ class _ServedFacade:
         })
         self._cfg = cfg
         self._host = cfg.hosts[0]
-        self.port: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._facade = None
         self._thread: threading.Thread | None = None
@@ -100,9 +112,8 @@ class _ServedFacade:
             )
             self._facade = build_facade(self._host.services[0], ctx)
             self._facade.bind_host = "127.0.0.1"
-            self._facade.port = 0
+            self._facade.port = self.port  # pre-picked free port
             loop.run_until_complete(self._facade.start())
-            self.port = self._facade.bound_port
         except BaseException as exc:  # surface startup failure to __enter__
             self._error = exc
             self._ready.set()
@@ -234,4 +245,85 @@ def _diff_attrs(real: dict, repl: dict) -> str:
             problems.append(f"~{name}")
     if problems:
         return "attrs " + ", ".join(sorted(problems))
+    return ""
+
+
+# ------------------------------------------------------------------------------- SMB
+
+
+def verify_smb(host: str, port: int = 445, *, username: str = "", password: str = "",
+               domain: str = "", timeout: float = 5.0) -> VerifyReport:
+    from rangefinder.capture.smb import capture_smb
+
+    service, warnings = capture_smb(host, port, username=username, password=password,
+                                    domain=domain, timeout=timeout, scrub=False)
+    report = VerifyReport("smb", f"{host}:{port}", warnings=list(warnings))
+    real_raw = {s["name"]: s.get("files", {}) for s in service.get("shares", [])}
+
+    with _ServedFacade(service) as srv:
+        repl_service = _recapture_smb("127.0.0.1", srv.port, username, password, domain, timeout)
+    repl_raw = {s["name"]: s.get("files", {}) for s in repl_service.get("shares", [])}
+
+    # SMB share and path names are case-insensitive per protocol — a client reaches the same
+    # share/file regardless of case — so equivalence is case-folded (file *content* is exact).
+    real = {k.casefold(): v for k, v in real_raw.items()}
+    repl = {k.casefold(): v for k, v in repl_raw.items()}
+    label = {k.casefold(): k for k in real_raw}
+    for key, files in real.items():
+        report.total += 1
+        if key not in repl:
+            report.divergences.append(Divergence(label[key], "missing", "share absent on replica"))
+            continue
+        detail = _diff_files(files, repl[key])
+        if detail:
+            report.divergences.append(Divergence(label[key], "files", detail))
+        else:
+            report.matched += 1
+    for key in repl:
+        if key not in real:
+            report.divergences.append(Divergence(key, "extra", "share only on replica"))
+
+    if set(real_raw) != set(repl_raw) and set(real) == set(repl):
+        report.boundary.append(
+            "share/path names compared case-insensitively (SMB is case-insensitive); the "
+            "impacket-backed replica normalises case, which tooling treats as identical")
+    report.boundary.append(
+        "fidelity claimed only for the "
+        + (f"'{username}'" if username else "null-session")
+        + " access level the capture exercised; deeper/authenticated reads not verified")
+    return report
+
+
+def _recapture_smb(host, port, username, password, domain, timeout, attempts: int = 6) -> dict:
+    """Enumerate the replica, retrying while the impacket server finishes coming up."""
+    from rangefinder.capture.smb import capture_smb
+
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            service, _ = capture_smb(host, port, username=username, password=password,
+                                     domain=domain, timeout=timeout, scrub=False)
+            return service
+        except Exception as exc:  # impacket raises many types on a not-yet-ready listener
+            last = exc
+            time.sleep(0.4)
+    raise RuntimeError(f"could not enumerate replica SMB after {attempts} tries: {last}")
+
+
+def _diff_files(real: dict, repl: dict) -> str:
+    # Paths are case-insensitive (SMB); content comparison stays byte-exact.
+    repl_cf = {p.casefold(): c for p, c in repl.items()}
+    real_cf = {p.casefold() for p in real}
+    problems: list[str] = []
+    for path, content in real.items():
+        cf = path.casefold()
+        if cf not in repl_cf:
+            problems.append(f"-{path}")
+        elif content != repl_cf[cf]:
+            problems.append(f"~{path}")
+    for path in repl:
+        if path.casefold() not in real_cf:
+            problems.append(f"+{path}")
+    if problems:
+        return "files " + ", ".join(sorted(problems))
     return ""

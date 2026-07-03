@@ -105,6 +105,13 @@ def main(argv: list[str] | None = None) -> int:
     p_v_ldap.add_argument("--password", default="")
     p_v_ldap.add_argument("--json", action="store_true", help="emit the report as JSON")
     p_v_http.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_v_smb = verify_sub.add_parser("smb", help="capture + diff live file shares")
+    p_v_smb.add_argument("host")
+    p_v_smb.add_argument("--port", type=int, default=445)
+    p_v_smb.add_argument("--username", default="", help="user (default: null session)")
+    p_v_smb.add_argument("--password", default="")
+    p_v_smb.add_argument("--domain", default="")
+    p_v_smb.add_argument("--json", action="store_true", help="emit the report as JSON")
 
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
@@ -349,11 +356,14 @@ def cmd_score(args) -> int:
 def cmd_verify(args) -> int:
     import dataclasses
 
-    from rangefinder.verify import verify_http, verify_ldap
+    from rangefinder.verify import verify_http, verify_ldap, verify_smb
 
     try:
         if args.proto == "http":
             report = verify_http(args.url, max_paths=args.max)
+        elif args.proto == "smb":
+            report = verify_smb(args.host, args.port, username=args.username,
+                                password=args.password, domain=args.domain)
         elif args.proto == "ldap":
             from urllib.parse import urlparse
 

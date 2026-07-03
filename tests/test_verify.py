@@ -10,7 +10,7 @@ import functools
 import http.server
 import threading
 
-from rangefinder.verify import _ServedFacade, verify_http, verify_ldap
+from rangefinder.verify import _ServedFacade, verify_http, verify_ldap, verify_smb
 
 
 def _serve_dir(directory):
@@ -76,3 +76,29 @@ def test_verify_ldap_round_trip():
     assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
     assert report.score == 1.0
     assert any("anonymous" in b for b in report.boundary)
+
+
+def test_verify_smb_round_trip():
+    service = {
+        "type": "smb", "port": 445, "server_os": "Windows Server 2022",
+        "shares": [
+            {"name": "public", "comment": "", "readonly": True,
+             "files": {"readme.txt": "hello from the share\n",
+                       "creds/db.conf": "db.password=Autumn2025!\n"}},
+        ],
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_smb("127.0.0.1", srv.port)
+
+    assert report.total == 1, report.warnings
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert any("null-session" in b for b in report.boundary)
+
+
+def test_diff_files_has_teeth():
+    from rangefinder.verify import _diff_files
+
+    assert _diff_files({"a": "1"}, {"a": "1"}) == ""
+    assert "~a" in _diff_files({"a": "1"}, {"a": "2"})   # changed content
+    assert "-a" in _diff_files({"a": "1"}, {})           # missing on replica
+    assert "+b" in _diff_files({}, {"b": "1"})           # extra on replica
