@@ -384,8 +384,8 @@ def cmd_verify(args) -> int:
         return EXIT_ERROR
 
     if args.json:
-        print(json.dumps(dataclasses.asdict(report) | {"score": report.score}, indent=2))
-        return EXIT_OK if report.matched == report.total else EXIT_ERROR
+        print(json.dumps(dataclasses.asdict(report) | {"score": report.score, "ok": report.ok}, indent=2))
+        return EXIT_OK if report.ok else EXIT_ERROR
 
     pct = report.score * 100
     print(f"Fidelity: {report.protocol}  {report.target}")
@@ -398,12 +398,19 @@ def cmd_verify(args) -> int:
         print("  fidelity boundary:")
         for b in report.boundary:
             print(f"    - {b}")
+    # Detection perspective: did the tool actions produce SIEM telemetry?
+    alert_note = f", {report.alerts} alert(s)" if report.alerts else ""
+    print(f"  detection: {report.telemetry_events} telemetry event(s){alert_note} emitted while probed")
+    if report.blind_spots:
+        print(f"  detection blind spots ({len(report.blind_spots)}) — served but not logged:")
+        for b in report.blind_spots:
+            print(f"    {b}")
     for w in report.warnings:
         print(f"  note: {w}", file=sys.stderr)
     print()
-    verdict = "FAITHFUL" if report.matched == report.total else "DIVERGENCES FOUND"
+    verdict = "FAITHFUL & OBSERVABLE" if report.ok else "ISSUES FOUND"
     print(f"  => {verdict}")
-    return EXIT_OK if report.matched == report.total else EXIT_ERROR
+    return EXIT_OK if report.ok else EXIT_ERROR
 
 
 def cmd_run(args) -> int:

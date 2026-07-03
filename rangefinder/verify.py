@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 from rangefinder.config.model import RangeConfig
 from rangefinder.facades.base import FacadeContext
 from rangefinder.facades.registry import build_facade
-from rangefinder.telemetry.emitter import Emitter
+from rangefinder.telemetry.emitter import Emitter, ListSink
 
 
 @dataclass
@@ -49,10 +49,30 @@ class VerifyReport:
     divergences: list[Divergence] = field(default_factory=list)
     boundary: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Detection perspective: telemetry the replica emitted while it was probed.
+    telemetry_events: int = 0
+    alerts: int = 0
+    blind_spots: list[str] = field(default_factory=list)
 
     @property
     def score(self) -> float:
         return 1.0 if self.total == 0 else self.matched / self.total
+
+    @property
+    def ok(self) -> bool:
+        """Faithful AND observable: no content divergence and no detection blind spot."""
+        return self.matched == self.total and not self.blind_spots
+
+
+def _detection(report: VerifyReport, events: list[dict], expected_paths=None) -> None:
+    """Record the SOC/defender perspective: did the probed actions produce telemetry?"""
+    report.telemetry_events = len(events)
+    report.alerts = sum(1 for e in events if e.get("event", {}).get("kind") == "alert")
+    if expected_paths is not None:
+        seen = {e.get("url", {}).get("path") for e in events}
+        report.blind_spots = [p for p in expected_paths if p not in seen]
+    elif report.total > 0 and not events:
+        report.blind_spots = ["no telemetry emitted while the replica served data"]
 
 
 # --------------------------------------------------------------- in-process facade server
@@ -85,11 +105,16 @@ class _ServedFacade:
         })
         self._cfg = cfg
         self._host = cfg.hosts[0]
+        self._sink = ListSink()  # capture the telemetry the facade emits while probed
         self._loop: asyncio.AbstractEventLoop | None = None
         self._facade = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: BaseException | None = None
+
+    @property
+    def events(self) -> list[dict]:
+        return list(self._sink.events)
 
     def __enter__(self) -> "_ServedFacade":
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -107,7 +132,7 @@ class _ServedFacade:
         try:
             ctx = FacadeContext(
                 host_id=self._host.id, host_name=self._host.hostname,
-                host_ip=str(self._host.ip), emitter=Emitter([]), config_dir=".",
+                host_ip=str(self._host.ip), emitter=Emitter([self._sink]), config_dir=".",
                 identities=self._cfg.identities, hosts=tuple(self._cfg.hosts),
             )
             self._facade = build_facade(self._host.services[0], ctx)
@@ -172,6 +197,9 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0) -> Veri
             report.boundary.append(
                 f"uncaptured paths diverge: real {real_a.status} vs replica {repl_a.status} "
                 "response for a path that was never probed (facade serves its default)")
+
+        time.sleep(0.15)  # let the last handler flush its event
+        _detection(report, srv.events, expected_paths=paths)
     return report
 
 
@@ -211,7 +239,10 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
         # Enumerate the replica through the facade's own rendering, same access level.
         repl_service, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
                                        password=password, timeout=timeout, scrub=False)
+        time.sleep(0.1)
+        det_events = srv.events
     repl = {e["dn"]: e["attributes"] for e in repl_service["entries"]}
+    _detection(report, det_events)
 
     for dn, attrs in real.items():
         report.total += 1
@@ -262,7 +293,10 @@ def verify_smb(host: str, port: int = 445, *, username: str = "", password: str 
 
     with _ServedFacade(service) as srv:
         repl_service = _recapture_smb("127.0.0.1", srv.port, username, password, domain, timeout)
+        time.sleep(0.1)
+        det_events = srv.events
     repl_raw = {s["name"]: s.get("files", {}) for s in repl_service.get("shares", [])}
+    _detection(report, det_events)
 
     # SMB share and path names are case-insensitive per protocol — a client reaches the same
     # share/file regardless of case — so equivalence is case-folded (file *content* is exact).

@@ -38,6 +38,10 @@ def test_verify_http_faithful(tmp_path):
     assert report.total >= 3, report.warnings
     assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
     assert report.score == 1.0
+    # detection perspective: every probed route produced telemetry, no blind spots
+    assert report.telemetry_events >= report.total
+    assert report.blind_spots == []
+    assert report.ok
 
 
 def test_diff_http_has_teeth():
