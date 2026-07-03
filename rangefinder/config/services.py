@@ -50,6 +50,9 @@ class HttpPath(BaseModel):
     # all, but still capture every attempt as telemetry).
     auth_realm: str | None = None
     auth_users: dict[str, str] = Field(default_factory=dict)
+    # NTLM (Windows integrated) auth: the route challenges with WWW-Authenticate: NTLM and
+    # validates the Type3 against the identities NT hashes (IIS/Exchange-style).
+    auth_ntlm: bool = False
 
 
 class HttpConfig(ServiceBase):

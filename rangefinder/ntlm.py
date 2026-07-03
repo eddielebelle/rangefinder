@@ -58,20 +58,37 @@ def build_challenge(type1_bytes: bytes, server_name: str, domain_name: str):
     return chal.getData(), challenge8, neg, chal
 
 
-def validate(type3_bytes: bytes, nthash: bytes | None, challenge8: bytes, negotiate, challenge):
-    """Return (domain, user, workstation, authenticated). nthash None => cannot validate."""
-    from impacket import ntlm
-    from impacket.smbserver import STATUS_SUCCESS, computeNTLMv2
+def validate(type3_bytes: bytes, nthash: bytes | None, challenge8: bytes, negotiate=None, challenge=None):
+    """Return (domain, user, workstation, authenticated). nthash None => cannot validate.
 
-    auth = ntlm.NTLMAuthChallengeResponse()
-    auth.fromString(type3_bytes)
-    domain = auth["domain_name"].decode("utf-16le")
-    user = auth["user_name"].decode("utf-16le")
-    workstation = auth["host_name"].decode("utf-16le")
+    Performs the NTLMv2 NTProofStr check directly (no session-key derivation), so it does
+    not choke on clients that negotiate key exchange (e.g. curl --ntlm) and it never raises
+    on an odd Type3 — an unparseable/NTLMv1 response is simply not authenticated.
+    """
+    from impacket import ntlm
+
+    try:
+        auth = ntlm.NTLMAuthChallengeResponse()
+        auth.fromString(type3_bytes)
+        # Strings are UTF-16LE only when Unicode was negotiated; clients that pick OEM
+        # (e.g. curl --ntlm) send them as single-byte, so honour the flag or "acme" decodes
+        # to CJK mojibake and the key derivation fails.
+        enc = "utf-16le" if int(auth["flags"]) & ntlm.NTLMSSP_NEGOTIATE_UNICODE else "latin-1"
+        domain = auth["domain_name"].decode(enc, "replace")
+        user = auth["user_name"].decode(enc, "replace")
+        workstation = auth["host_name"].decode(enc, "replace")
+    except Exception:
+        return "", "", "", False
+
     if nthash is None:
         return domain, user, workstation, False
-    status, _ = computeNTLMv2(user.lower(), b"", nthash, challenge8, auth, challenge, negotiate)
-    return domain, user, workstation, status == STATUS_SUCCESS
+    response = bytes(auth["ntlm"])
+    if len(response) < 16:  # NTLMv1 or malformed — not supported for validation
+        return domain, user, workstation, False
+    response_key = ntlm.NTOWFv2(user, "", domain, nthash)
+    nt_proof, temp = response[:16], response[16:]
+    expected = ntlm.hmac_md5(response_key, challenge8 + temp)
+    return domain, user, workstation, nt_proof == expected
 
 
 def nt_hash(password: str) -> bytes:

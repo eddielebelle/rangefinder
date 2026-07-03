@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -49,6 +50,7 @@ class _Route:
     vuln_id: str | None
     auth_realm: str | None = None
     auth_users: dict[str, str] = field(default_factory=dict)
+    auth_ntlm: bool = False
 
 
 @dataclass
@@ -75,6 +77,11 @@ class HttpFacade(Facade):
         )
         self.cfg = cfg
         self.routes: dict[str, _Route] = {}
+        ids = ctx.identities
+        self._passwords = {u.sam.lower(): u.password for u in (ids.users if ids else []) if u.password}
+        self._netbios = (
+            (ids.netbios or ids.domain.split(".")[0].upper()) if ids else "WORKGROUP"
+        )
 
     @classmethod
     def from_config(cls, cfg: HttpConfig, ctx: FacadeContext) -> "HttpFacade":
@@ -90,11 +97,33 @@ class HttpFacade(Facade):
         return self
 
     async def handle(self, scope, reader, writer):
+        ntlm_state: dict = {}  # per-connection NTLM auth state (keep-alive)
         while True:
             req = await self._read_request(reader)
             if req is None:
                 return  # EOF or unrecoverable parse error (already responded if 400)
             route = self.routes.get(req.path)
+
+            if route is not None and route.auth_ntlm:
+                gate = self._ntlm_gate(scope, req, ntlm_state)
+                if gate is not None:  # not yet authorized -> challenge / reject
+                    g_status, g_headers = gate
+                    close = not self.cfg.keepalive or req.wants_close
+                    resp_bytes = await self._send(
+                        writer, req, g_status, b"", "text/plain; charset=utf-8", g_headers, close
+                    )
+                    scope.emit(ev.http_request(
+                        scope, method=req.method, path=req.path, query=req.query,
+                        original=req.target, version=req.version,
+                        user_agent=req.headers.get("user-agent"),
+                        referrer=req.headers.get("referer"), status_code=g_status,
+                        request_bytes=req.nbytes, response_bytes=resp_bytes,
+                        matched_route=req.path, vuln_id=None,
+                    ))
+                    if close:
+                        return
+                    continue
+
             status, body, content_type, headers, vuln_id, matched = self._resolve(
                 req, route
             )
@@ -246,6 +275,46 @@ class HttpFacade(Facade):
             req.path,
         )
 
+    def _ntlm_gate(self, scope, req: _Request, state: dict):
+        """NTLM over HTTP. Returns None when authorized, else (status, headers) to send."""
+        if state.get("authenticated"):
+            return None
+        auth = req.headers.get("authorization", "")
+        if auth[:5].lower() != "ntlm ":
+            return (401, {"WWW-Authenticate": "NTLM"})
+        try:
+            token = base64.b64decode(auth[5:].strip())
+        except (binascii.Error, ValueError):
+            return (401, {"WWW-Authenticate": "NTLM"})
+        if len(token) < 12 or token[:7] != b"NTLMSSP":
+            return (401, {"WWW-Authenticate": "NTLM"})
+
+        msg_type = struct.unpack("<I", token[8:12])[0]
+        if msg_type == 1:  # Type1 -> Type2 challenge
+            from rangefinder.ntlm import build_challenge
+
+            type2, ch8, neg, chal = build_challenge(token, self.ctx.host_name.upper(), self._netbios)
+            state.update(ch8=ch8, neg=neg, chal=chal)
+            return (401, {"WWW-Authenticate": "NTLM " + base64.b64encode(type2).decode()})
+        if msg_type == 3:  # Type3 -> validate
+            from rangefinder.ntlm import nt_hash, validate
+
+            neg, chal, ch8 = state.get("neg"), state.get("chal"), state.get("ch8")
+            if neg is None:
+                return (401, {"WWW-Authenticate": "NTLM"})
+            domain, user, _ws, _ = validate(token, None, ch8, neg, chal)
+            pw = self._passwords.get(user.lower())
+            _, _, _, ok = validate(token, nt_hash(pw) if pw else None, ch8, neg, chal)
+            scope.emit(ev.http_auth(
+                scope, scheme="ntlm", username=f"{domain}\\{user}" if domain else user,
+                password=None, path=req.path, outcome="success" if ok else "failure",
+            ))
+            if ok:
+                state["authenticated"] = True
+                return None
+            return (401, {"WWW-Authenticate": "NTLM"})
+        return (401, {"WWW-Authenticate": "NTLM"})
+
     # ---- response writing --------------------------------------------------------
     async def _send(
         self,
@@ -309,4 +378,5 @@ def _build_route(spec: HttpPath, config_dir: str) -> _Route:
         vuln_id=spec.vuln_id,
         auth_realm=spec.auth_realm,
         auth_users=dict(spec.auth_users),
+        auth_ntlm=spec.auth_ntlm,
     )

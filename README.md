@@ -46,7 +46,7 @@ A range config has four parts:
 
 | type | facade | notes |
 |------|--------|-------|
-| `http` | HTTP/1.1(S) server | server header, canned route table, planted-vuln routes, HEAD, keep-alive. `tls: true` for HTTPS. Routes gate on Basic auth (`auth_realm`/`auth_users`) and every credential attempt is captured as telemetry |
+| `http` | HTTP/1.1(S) server | server header, canned route table, planted-vuln routes, HEAD, keep-alive. `tls: true` for HTTPS. Routes gate on Basic auth (`auth_realm`/`auth_users`) or NTLM (`auth_ntlm: true`, validated against the identities NT hashes — IIS/OWA-style); every credential attempt is captured as telemetry |
 | `banner` | generic TCP banner | text banner + regex rules (FTP/SMTP/POP3), or `binary: true` with `banner_hex` / hex `match_hex`+`respond_hex` rules for binary protocols (MySQL greeting, RDP X.224) so nmap `-sV` versions them |
 | `ssh` | real SSH server | asyncssh-backed: genuine key exchange, so clients reach auth. Captures every password/public-key attempt as telemetry and rejects it; `accept_creds` lets a planted login succeed into a decoy shell that logs typed commands. `server_version` sets the OpenSSH banner nmap reads |
 | `kerberos` | KDC (roasting) | answers AS-REQ + TGS-REQ on 88 (UDP+TCP) with AES/RC4 pre-auth (advertises the salt via PA-ETYPE-INFO2). **AS-REP roasting**: a `no_preauth` account yields a real `$krb5asrep$` (GetNPUsers). **Kerberoasting**: an account with an `spn` yields a `$krb5tgs$` over the AS→TGS flow. Crackable tickets, logged as alerts. A roasting decoy, not a full KDC |

@@ -109,6 +109,8 @@
             "/robots.txt": { "content_type": "text/plain; charset=utf-8", "body": "User-agent: *\nDisallow: /admin\nDisallow: /backup\nDisallow: /api\n" },
             "/admin": { "auth_realm": "ACME Admin", "auth_users": { "admin": "admin" },
               "body": "<html><body><h1>ACME Admin Panel</h1><p>Server management console.</p></body></html>" },
+            "/owa": { "auth_ntlm": true,
+              "body": "<html><body><h1>Outlook Web App</h1><p>Mailbox: svc-web@acme.corp</p></body></html>" },
             "/backup/db.config": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-db-config",
               "body": "<connectionStrings>\n  <add name=\"acme\" connectionString=\"Server=app01;Database=acme;User Id=svc-sql;Password=Summ3r2025!;\" />\n</connectionStrings>\n" },
             "/.git/HEAD": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-git-dir", "body": "ref: refs/heads/main\n" }
