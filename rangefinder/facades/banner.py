@@ -10,6 +10,7 @@ everything it sees is logged.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 
 from rangefinder.config.services import BannerConfig
@@ -52,8 +53,13 @@ class BannerFacade(Facade):
         if self.cfg.banner_delay_ms:
             await asyncio.sleep(self.cfg.banner_delay_ms / 1000)
 
-        if self._banner_bytes:
-            writer.write(self._banner_bytes)
+        greeting = self._banner_bytes
+        if greeting and self.cfg.protocol == "mysql":
+            # Real mysqld emits a fresh random salt + connection id every connect; a static
+            # handshake (identical across connections) is an obvious decoy tell.
+            greeting = _randomize_mysql_greeting(greeting)
+        if greeting:
+            writer.write(greeting)
             await writer.drain()
             scope.emit(ev.banner_sent(scope, self.cfg.banner or self.cfg.banner_hex or ""))
 
@@ -124,6 +130,31 @@ class BannerFacade(Facade):
             # holding unmatched probes open stalls scanners like nmap --version-all.
             if close_after or matched_rule is None:
                 return
+
+
+def _randomize_mysql_greeting(data: bytes) -> bytes:
+    """Freshen the random fields of a MySQL HandshakeV10 packet per connection.
+
+    Layout after the 4-byte packet header: [1 protocol=0x0a][server-version \\0]
+    [4 connection-id][8 auth-plugin-data-1][1 filler][2 cap-low][1 charset][2 status]
+    [2 cap-high][1 auth-len][10 reserved][12 auth-plugin-data-2]... We only touch the
+    connection id and the two salt halves — the fields real mysqld randomizes — leaving the
+    configured version/capabilities intact. Returns the input unchanged if it is not a v10
+    handshake.
+    """
+    try:
+        if len(data) < 40 or data[4] != 0x0A:
+            return data
+        nul = data.index(0, 5)  # terminator of the server-version string
+        b = bytearray(data)
+        p = nul + 1
+        b[p:p + 4] = os.urandom(4)          # connection / thread id
+        b[p + 4:p + 12] = os.urandom(8)     # auth-plugin-data part 1
+        salt2 = p + 12 + 1 + 2 + 1 + 2 + 2 + 1 + 10  # skip filler + caps + charset + status + reserved
+        b[salt2:salt2 + 12] = os.urandom(12)  # auth-plugin-data part 2
+        return bytes(b)
+    except (ValueError, IndexError):
+        return data
 
 
 def _greeting_bytes(cfg: BannerConfig) -> bytes:

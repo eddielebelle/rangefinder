@@ -64,3 +64,23 @@ def test_empty_banner_decoy_just_opens_port():
     assert data == b"\r\n"  # empty banner + terminator
     acts = actions(sink)
     assert "connection_open" in acts and "connection_close" in acts
+
+
+def test_mysql_greeting_randomized_per_connection():
+    """Real mysqld varies the salt + connection id each connect; a static handshake is a tell."""
+    from rangefinder.facades.banner import _randomize_mysql_greeting
+
+    base = bytes.fromhex(
+        "5a0000000a382e302e33352d307562756e7475302e32322e30342e31003600000001020304050607"
+        "0800fff7210200ff811500000000000000000000090a0b0c0d0e0f10111213006d7973716c5f6e61"
+        "746976655f70617373776f726400")
+    a = _randomize_mysql_greeting(base)
+    b = _randomize_mysql_greeting(base)
+    assert a != b                        # per-connection randomness
+    assert len(a) == len(base)           # structure/length preserved
+    assert a[:5] == base[:5]             # packet header + protocol version intact
+    nul = base.index(0, 5)
+    assert a[5:nul] == base[5:nul]       # server-version string preserved
+    assert a[nul + 1:nul + 5] != base[nul + 1:nul + 5]   # connection id no longer the static 0x36
+    # non-handshake input is passed through untouched
+    assert _randomize_mysql_greeting(b"\x00\x00\x00\x00\xff") == b"\x00\x00\x00\x00\xff"
