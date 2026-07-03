@@ -213,6 +213,10 @@ produced — and for HTTP a route the facade serves but never *logs* surfaces as
 "blind spot". A range that answers tools but stays silent in the SIEM fails the SOC-eval
 purpose, so `verify` reports `FAITHFUL & OBSERVABLE` only when both hold.
 
+`verify http --nmap` adds the recon-tool perspective: it runs `nmap -sV` against the real
+target and the replica and compares the service/version fingerprint (skipped with a note if
+nmap isn't installed).
+
 Equivalence is defined per protocol at the level the *tooling* cares about — e.g. SMB share
 and path names are compared case-insensitively because SMB itself is, so a replica that
 serves `PUBLIC` for a real `public` reads as faithful (a client reaches the same share

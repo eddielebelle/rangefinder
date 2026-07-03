@@ -60,8 +60,8 @@ class VerifyReport:
 
     @property
     def ok(self) -> bool:
-        """Faithful AND observable: no content divergence and no detection blind spot."""
-        return self.matched == self.total and not self.blind_spots
+        """Faithful AND observable: no divergence of any kind and no detection blind spot."""
+        return not self.divergences and not self.blind_spots
 
 
 def _detection(report: VerifyReport, events: list[dict], expected_paths=None) -> None:
@@ -161,7 +161,8 @@ class _ServedFacade:
 # ------------------------------------------------------------------------------- HTTP
 
 
-def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0) -> VerifyReport:
+def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
+                nmap: bool = False) -> VerifyReport:
     from rangefinder.capture.http import _KEEP_HEADERS, _build_opener, _fetch, capture_http
 
     service, warnings = capture_http(url, max_paths=max_paths, scrub=False, timeout=timeout)
@@ -169,6 +170,8 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0) -> Veri
 
     parsed = urlparse(url if "://" in url else "http://" + url)
     real_base = f"{parsed.scheme or 'http'}://{parsed.netloc}"
+    real_host = parsed.hostname or "127.0.0.1"
+    real_port = parsed.port or (443 if parsed.scheme == "https" else 80)
     paths = sorted((service.get("paths") or {}).keys())
     if not paths:
         report.warnings.append("no routes captured; nothing to verify")
@@ -200,7 +203,58 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0) -> Veri
 
         time.sleep(0.15)  # let the last handler flush its event
         _detection(report, srv.events, expected_paths=paths)
+
+        if nmap:  # recon-tool perspective: does nmap -sV fingerprint them the same?
+            _add_nmap(report, real_host, real_port, srv.port, timeout=90.0)
     return report
+
+
+def _add_nmap(report: VerifyReport, real_host: str, real_port: int, repl_port: int,
+              timeout: float) -> None:
+    real_fp, err = _nmap_fingerprint(real_host, real_port, timeout)
+    if err:
+        report.boundary.append(f"nmap -sV fingerprint not checked ({err})")
+        return
+    repl_fp, _ = _nmap_fingerprint("127.0.0.1", repl_port, timeout)
+    if real_fp is None:
+        report.boundary.append("nmap -sV detected no service to compare")
+    elif real_fp != repl_fp:
+        report.divergences.append(Divergence(
+            f"port {real_port}", "fingerprint", f"nmap -sV '{real_fp}' vs replica '{repl_fp}'"))
+    else:
+        report.boundary.append(f"nmap -sV fingerprint matches: {real_fp}")
+
+
+def _nmap_fingerprint(host: str, port: int, timeout: float):
+    """Return (fingerprint_string_or_None, error_or_None) from an nmap -sV scan of one port."""
+    import shutil
+    import subprocess
+
+    if shutil.which("nmap") is None:
+        return None, "nmap not installed"
+    try:
+        proc = subprocess.run(
+            ["nmap", "-sV", "-Pn", "-p", str(port), "--version-intensity", "5", "-oX", "-", host],
+            capture_output=True, timeout=timeout, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return None, f"nmap failed: {exc}"
+    return _parse_nmap_service(proc.stdout), None
+
+
+def _parse_nmap_service(xml: bytes):
+    """Extract a normalized 'name product version' fingerprint from nmap -oX output."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+    svc = root.find(".//port/service")
+    if svc is None:
+        return None
+    parts = [svc.get(k) for k in ("name", "product", "version") if svc.get(k)]
+    return " ".join(parts) or None
 
 
 def _diff_http(path, real, repl, compare_headers) -> list[Divergence]:

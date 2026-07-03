@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
     p_v_http = verify_sub.add_parser("http", help="capture + diff a live web server")
     p_v_http.add_argument("url", help="base URL, e.g. http://10.0.0.5/")
     p_v_http.add_argument("--max", type=int, default=200, help="max paths to probe")
+    p_v_http.add_argument("--nmap", action="store_true",
+                          help="also compare the nmap -sV service fingerprint (needs nmap)")
     p_v_ldap = verify_sub.add_parser("ldap", help="capture + diff a live directory")
     p_v_ldap.add_argument("host", help="host or ldap[s]://host")
     p_v_ldap.add_argument("--port", type=int, default=None)
@@ -384,7 +386,7 @@ def cmd_verify(args) -> int:
 
     try:
         if args.proto == "http":
-            report = verify_http(args.url, max_paths=args.max)
+            report = verify_http(args.url, max_paths=args.max, nmap=args.nmap)
         elif args.proto == "smb":
             report = verify_smb(args.host, args.port, username=args.username,
                                 password=args.password, domain=args.domain)

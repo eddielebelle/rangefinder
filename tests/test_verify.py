@@ -126,3 +126,33 @@ def test_diff_files_has_teeth():
     assert "~a" in _diff_files({"a": "1"}, {"a": "2"})   # changed content
     assert "-a" in _diff_files({"a": "1"}, {})           # missing on replica
     assert "+b" in _diff_files({}, {"b": "1"})           # extra on replica
+
+
+def test_parse_nmap_service():
+    from rangefinder.verify import _parse_nmap_service
+
+    xml = (b'<?xml version="1.0"?><nmaprun><host><ports>'
+           b'<port protocol="tcp" portid="80"><state state="open"/>'
+           b'<service name="http" product="nginx" version="1.31.2" method="probed"/>'
+           b'</port></ports></host></nmaprun>')
+    assert _parse_nmap_service(xml) == "http nginx 1.31.2"
+    assert _parse_nmap_service(b"not xml at all") is None
+    assert _parse_nmap_service(b"<nmaprun></nmaprun>") is None
+
+
+def test_verify_http_nmap_skips_gracefully(tmp_path):
+    import shutil
+
+    if shutil.which("nmap") is not None:
+        return  # only asserting the graceful-skip path, which needs nmap absent
+    root = tmp_path / "web"
+    root.mkdir()
+    (root / "index.html").write_text("<html>home</html>")
+    httpd, port = _serve_dir(root)
+    try:
+        report = verify_http(f"http://127.0.0.1:{port}", max_paths=40, nmap=True)
+    finally:
+        httpd.shutdown()
+    assert any("nmap" in b for b in report.boundary)
+    assert not any(d.kind == "fingerprint" for d in report.divergences)
+    assert report.ok  # skipped check must not fail the run
