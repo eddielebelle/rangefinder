@@ -344,6 +344,62 @@ def _recapture_smb(host, port, username, password, domain, timeout, attempts: in
     raise RuntimeError(f"could not enumerate replica SMB after {attempts} tries: {last}")
 
 
+# ------------------------------------------------------------------------------- DNS
+
+
+def verify_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0) -> VerifyReport:
+    from rangefinder.capture.dns import _server_ip, capture_dns
+
+    service, warnings = capture_dns(host, port, zone=zone, timeout=timeout, scrub=False)
+    report = VerifyReport("dns", f"{host}:{port} ({zone})", warnings=list(warnings))
+    queries = sorted({(r["name"], r["type"]) for r in service["records"]})
+    if not queries:
+        report.warnings.append("no records captured; nothing to verify")
+        return report
+
+    server = _server_ip(host)
+    with _ServedFacade(service) as srv:
+        for name, rtype in queries:
+            report.total += 1
+            real_ans = _dns_answers(server, port, name, rtype, timeout)
+            repl_ans = _dns_answers("127.0.0.1", srv.port, name, rtype, timeout)
+            if real_ans != repl_ans:
+                report.divergences.append(Divergence(
+                    f"{name} {rtype}", "answers",
+                    f"{sorted(real_ans)} vs replica {sorted(repl_ans)}"))
+            else:
+                report.matched += 1
+        time.sleep(0.1)
+        det_events = srv.events
+    _detection(report, det_events)
+    report.boundary.append(
+        "verified the records the capture found (AXFR or the probe set); names never queried "
+        "are not covered — DNS has no reliable enumeration without a zone transfer")
+    return report
+
+
+def _dns_answers(server: str, port: int, name: str, rtype: str, timeout: float) -> frozenset:
+    import dns.exception
+    import dns.flags
+    import dns.message
+    import dns.query
+    import dns.rdatatype
+
+    try:
+        q = dns.message.make_query(name, rtype)
+        resp = dns.query.udp(q, server, port=port, timeout=timeout)
+        if resp.flags & dns.flags.TC:
+            resp = dns.query.tcp(q, server, port=port, timeout=timeout)
+    except dns.exception.DNSException:
+        return frozenset()
+    out = set()
+    for rrset in resp.answer:
+        label = dns.rdatatype.to_text(rrset.rdtype)
+        for rdata in rrset:
+            out.add(f"{label}:{rdata.to_text()}")
+    return frozenset(out)
+
+
 def _diff_files(real: dict, repl: dict) -> str:
     # Paths are case-insensitive (SMB); content comparison stays byte-exact.
     repl_cf = {p.casefold(): c for p, c in repl.items()}

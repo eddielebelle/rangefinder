@@ -82,6 +82,15 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_smb.add_argument("--host-id", default=None)
     p_cap_smb.add_argument("--scrub", action="store_true", help="redact captured secrets")
 
+    p_cap_dns = capture_sub.add_parser("dns", help="capture a live DNS zone -> dns facade")
+    p_cap_dns.add_argument("host", help="DNS server host or IP")
+    p_cap_dns.add_argument("--zone", required=True, help="zone to capture, e.g. acme.corp")
+    p_cap_dns.add_argument("--port", type=int, default=53)
+    p_cap_dns.add_argument("-o", "--out", type=Path, default=None)
+    p_cap_dns.add_argument("--name", default=None, help="range name")
+    p_cap_dns.add_argument("--host-id", default=None)
+    p_cap_dns.add_argument("--scrub", action="store_true", help="redact captured secrets")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -112,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     p_v_smb.add_argument("--password", default="")
     p_v_smb.add_argument("--domain", default="")
     p_v_smb.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_v_dns = verify_sub.add_parser("dns", help="capture + diff a live DNS zone")
+    p_v_dns.add_argument("host")
+    p_v_dns.add_argument("--zone", required=True, help="zone, e.g. acme.corp")
+    p_v_dns.add_argument("--port", type=int, default=53)
+    p_v_dns.add_argument("--json", action="store_true", help="emit the report as JSON")
 
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
@@ -225,6 +239,16 @@ def cmd_capture(args) -> int:
             print(f"error: SMB capture failed: {exc}", file=sys.stderr)
             return EXIT_ERROR
         default_id = "fs"
+    elif args.captor == "dns":
+        from rangefinder.capture import capture_dns
+
+        hostname = args.host
+        try:
+            service, warnings = capture_dns(hostname, args.port, zone=args.zone, scrub=args.scrub)
+        except (ValueError, OSError) as exc:
+            print(f"error: DNS capture failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        default_id = "ns"
     else:
         print(f"error: unknown captor {args.captor!r}", file=sys.stderr)
         return EXIT_ERROR
@@ -356,7 +380,7 @@ def cmd_score(args) -> int:
 def cmd_verify(args) -> int:
     import dataclasses
 
-    from rangefinder.verify import verify_http, verify_ldap, verify_smb
+    from rangefinder.verify import verify_dns, verify_http, verify_ldap, verify_smb
 
     try:
         if args.proto == "http":
@@ -364,6 +388,8 @@ def cmd_verify(args) -> int:
         elif args.proto == "smb":
             report = verify_smb(args.host, args.port, username=args.username,
                                 password=args.password, domain=args.domain)
+        elif args.proto == "dns":
+            report = verify_dns(args.host, args.port, zone=args.zone)
         elif args.proto == "ldap":
             from urllib.parse import urlparse
 

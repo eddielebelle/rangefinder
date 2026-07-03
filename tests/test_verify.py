@@ -10,7 +10,7 @@ import functools
 import http.server
 import threading
 
-from rangefinder.verify import _ServedFacade, verify_http, verify_ldap, verify_smb
+from rangefinder.verify import _ServedFacade, verify_dns, verify_http, verify_ldap, verify_smb
 
 
 def _serve_dir(directory):
@@ -97,6 +97,26 @@ def test_verify_smb_round_trip():
     assert report.total == 1, report.warnings
     assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
     assert any("null-session" in b for b in report.boundary)
+
+
+def test_verify_dns_round_trip():
+    service = {
+        "type": "dns", "port": 53, "zone": "acme.corp", "autofill_hosts": False,
+        "records": [
+            {"name": "acme.corp", "type": "A", "value": "10.20.0.10", "ttl": 300},
+            {"name": "dc01.acme.corp", "type": "A", "value": "10.20.0.10", "ttl": 300},
+            {"name": "acme.corp", "type": "MX", "value": "10 mail.acme.corp", "ttl": 300},
+            {"name": "_ldap._tcp.acme.corp", "type": "SRV",
+             "value": "0 100 389 dc01.acme.corp", "ttl": 300},
+            {"name": "acme.corp", "type": "TXT", "value": "v=spf1 -all", "ttl": 300},
+        ],
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_dns("127.0.0.1", srv.port, zone="acme.corp")
+
+    assert report.total >= 4, report.warnings
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert report.telemetry_events >= report.total  # every query logged a dns_query event
 
 
 def test_diff_files_has_teeth():

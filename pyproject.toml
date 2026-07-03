@@ -16,6 +16,7 @@ dependencies = [
     "pyasn1-modules>=0.4",
     "impacket>=0.11",
     "asyncssh>=2.14",
+    "dnspython>=2.6",
 ]
 
 [project.optional-dependencies]

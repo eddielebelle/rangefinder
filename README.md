@@ -64,6 +64,7 @@ rangefinder import nmap scan.xml -o cfg.json      # discover topology from an nm
 rangefinder capture http https://host/ -o cfg.json  # record a live web server -> faithful facade
 rangefinder capture ldap 10.0.0.10 -o cfg.json    # record a live directory -> faithful facade
 rangefinder capture smb  10.0.0.20 -o cfg.json    # record live file shares -> faithful facade
+rangefinder capture dns  10.0.0.10 --zone acme.corp  # record a live DNS zone -> faithful facade
 rangefinder verify http http://10.0.0.30/         # measure replica fidelity vs the live target
 rangefinder score examples/acme.json log.jsonl   # score objectives against a telemetry log
 rangefinder run --host web01 --config examples/corp.json   # serve one host (container entrypoint)
@@ -167,8 +168,11 @@ computer objects, a service account's leaked `description`); if it's locked down
 returns just as little. `capture smb` does the same for file shares: it lists shares and walks
 the file tree readable at the given access level (null session by default), recording the files
 verbatim — so a null-session-readable share reproduces with the same tree on the replica.
-(`http`, `ldap`, and `smb` captors ship; text is captured verbatim, binary/oversized files are
-recorded by name with a placeholder.)
+`capture dns` records a zone: it takes a zone transfer (AXFR) if the server allows one — the
+transfer being permitted is itself an exposure that carries through — otherwise it queries a
+probe set of the names tooling asks for (the apex, common hostnames, and the AD service SRV
+records). (`http`, `ldap`, `smb`, and `dns` captors ship; text is captured verbatim,
+binary/oversized files are recorded by name with a placeholder.)
 
 ### Verifying fidelity
 
@@ -182,6 +186,7 @@ classes:
 rangefinder verify http http://10.0.0.30/           # per route: status + body + security headers
 rangefinder verify ldap 10.0.0.10 --bind-dn cn=admin,... --password …   # entry DNs + attribute sets
 rangefinder verify smb  10.0.0.20 --username … --password …   # share names + file tree + content
+rangefinder verify dns  10.0.0.10 --zone acme.corp            # record answer sets per name/type
 ```
 
 ```
@@ -198,7 +203,15 @@ the real target is always re-fetched live (comparing the facade to its own captu
 would be a tautology), and fidelity is only claimed for the *perspective the capture
 exercised* (e.g. an anonymous bind — never a credentialed or deeper read it never saw).
 Exit code is non-zero on any divergence, so it gates in CI. Validated against genuine
-third-party software (nginx, OpenLDAP, Samba), not just against itself.
+third-party software (nginx, OpenLDAP, Samba, CoreDNS), not just against itself — a run
+against CoreDNS caught a real capture bug (relative SRV/MX targets), which is exactly what
+the harness is for.
+
+Every run also checks the **detection perspective**: the telemetry the replica emits while
+probed is captured, so the report shows how many SIEM events and alerts the tool actions
+produced — and for HTTP a route the facade serves but never *logs* surfaces as a detection
+"blind spot". A range that answers tools but stays silent in the SIEM fails the SOC-eval
+purpose, so `verify` reports `FAITHFUL & OBSERVABLE` only when both hold.
 
 Equivalence is defined per protocol at the level the *tooling* cares about — e.g. SMB share
 and path names are compared case-insensitively because SMB itself is, so a replica that
