@@ -55,6 +55,8 @@ A range config has four parts:
 rangefinder validate examples/corp.json     # validate + summarize (exit 2 on error)
 rangefinder schema -o range.schema.json      # export JSON Schema for editor autocomplete
 rangefinder gen examples/corp.json -o build/ # emit build/docker-compose.yml + config.json
+rangefinder import nmap scan.xml -o cfg.json      # discover topology from an nmap scan
+rangefinder capture http https://host/ -o cfg.json  # record a live web server -> faithful facade
 rangefinder score examples/acme.json log.jsonl   # score objectives against a telemetry log
 rangefinder run --host web01 --config examples/corp.json   # serve one host (container entrypoint)
 rangefinder up   -o build/                   # docker compose up -d  (thin wrapper)
@@ -108,34 +110,36 @@ Example event (an HTTP hit on a planted vuln):
 "rangefinder":{"vuln_id":"exposed-git-dir","conn_id":"..."}}
 ```
 
-## Importing real infrastructure
+## Recreating real infrastructure
 
-To build a range that mirrors a real environment (for detection testing against *your*
-network), import an nmap scan:
+Build a range that mirrors a real environment in two steps: **discover** the topology,
+then **capture** each service's real behavior so its weaknesses carry through.
 
 ```bash
-nmap -sV -sC -oX scan.xml 10.0.0.0/24        # -sC / --script drives the posture layer
+# 1. discover — nmap fingerprints what's listening -> a config skeleton
+nmap -sV -oX scan.xml 10.0.0.0/24
 rangefinder import nmap scan.xml --name prod-replica -o prod.json
-rangefinder validate prod.json               # then gen + up as usual
+
+# 2. capture — record a live service's actual responses into a faithful facade
+rangefinder capture http https://10.0.0.30/ -o web.json          # verbatim (faithful twin)
+rangefinder capture http https://10.0.0.30/ --scrub -o web.json  # redact secrets to share
 ```
 
-The importer produces two layers:
+The design principle: **the range carries the weakness, not a catalog that names it.**
+`import` is pure discovery (host → range host; port → facade). `capture` is record-replay
+— it probes the live service and records the actual `(status, headers, body)` it returned,
+and the facade replays them. Any weakness in the real responses (an exposed `/.git`, a
+directory listing, a verbose error, a leaked config, whatever anonymous access returns)
+reproduces automatically, because it was captured — not because any code recognizes it.
+Round-tripped end to end, nmap's `http-git` script flags the exposed repo on the *replica*
+just as it would on the original.
 
-- **Topology + versions** — each up host → a range host; each open port → a facade
-  (http/https → `http`, ssh → `ssh`, else a labelled `banner` decoy with the detected
-  version). Subnet is derived from the host IPs (`--subnet` to override).
-- **Security posture** — nmap NSE `<script>` output is translated into config that
-  *reproduces the misconfigurations found*: exposed web paths (`http-git`, `http-enum`)
-  become planted routes tagged as vulns; null-session SMB shares (`smb-enum-shares`)
-  become a real `smb` facade; and each finding (anonymous LDAP/FTP, weak TLS,
-  unauthenticated Redis/Mongo, …) becomes an auto-generated **objective** — so the
-  imported range ships with a scorecard of the org's real weaknesses.
+**Verbatim by default, `--scrub` optional.** A capture holds real content, which is fine
+for a range owned by the org it mirrors; `--scrub` runs bodies/headers through a
+best-effort redactor (emails, tokens, `password=…`) so the config can leave the org —
+structure stays faithful, so the weakness still carries through.
 
-**Posture, not data.** The importer captures the *property* of a weakness (a path is
-exposed, a share is null-session readable, LDAP answers anonymously) and structural
-names/paths — never bulk data or secret values. Share contents are placeholdered. This
-keeps the replica safe to share while still faithful to what a defender needs to detect.
-Run nmap with NSE scripts to populate the posture layer; a bare `-sV` yields topology only.
+(`capture http` is the first captor; LDAP/SMB capture follow the same record-replay shape.)
 
 ## Scoring
 

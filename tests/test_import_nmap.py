@@ -50,41 +50,10 @@ def test_derived_subnet():
     assert summary["subnet"] == "10.10.0.0/24"
 
 
-def test_captures_misconfigs_from_nse_scripts():
-    config, summary, _ = import_nmap(FIXTURES / "nmap-scripts.xml", name="corp")
-    RangeConfig.model_validate(config)  # still valid with objectives
-
-    obj_ids = {o["id"] for o in config["objectives"]}
-    # exposed web paths -> objectives + routes
-    assert "web01-exposed-git" in obj_ids
-    assert "web01-exposed-admin" in obj_ids
-    assert "web01-exposed-backup" in obj_ids
-    # SMB null-session shares + LDAP anon + FTP anon
-    assert "fs01-smb-null-session" in obj_ids
-    assert "fs01-ldap-anon" in obj_ids
-    assert "web01-exposed-git" in obj_ids
-
-    web = next(h for h in config["hosts"] if h["id"] == "web01")
-    http = next(s for s in web["services"] if s["type"] == "http")
-    assert "/.git/HEAD" in http["paths"]
-    assert http["paths"]["/.git/HEAD"]["vuln_id"] == "exposed-git-repo"
-    assert http["paths"]["/admin"]["vuln_id"] == "exposed-admin"
-    # a non-sensitive path is planted without a vuln tag
-    assert "/images" in http["paths"] and "vuln_id" not in http["paths"]["/images"]
-
-    # 445 promoted to a real smb facade with the enumerated shares (IPC$ dropped)
-    fs = next(h for h in config["hosts"] if h["id"] == "fs01")
-    smb = next(s for s in fs["services"] if s["type"] == "smb")
-    share_names = {sh["name"] for sh in smb["shares"]}
-    assert share_names == {"Finance", "HR", "IT"}
-    assert smb["signing_required"] is False
-
-    assert summary["scoreable_objectives"] >= 4
-
-
-def test_ftp_anon_objective():
-    config, _, _ = import_nmap(FIXTURES / "nmap-scripts.xml")
-    assert any(o["id"].endswith("-ftp-anon") for o in config["objectives"])
+def test_import_is_topology_only():
+    # nmap import is discovery only — no misconfig objectives are fabricated.
+    config, _, _ = import_nmap(FIXTURES / "nmap-basic.xml")
+    assert "objectives" not in config
 
 
 def test_rejects_non_nmap_xml(tmp_path):

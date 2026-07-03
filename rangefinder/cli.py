@@ -50,6 +50,16 @@ def main(argv: list[str] | None = None) -> int:
     p_imp_nmap.add_argument("--name", default="imported", help="range name")
     p_imp_nmap.add_argument("--subnet", default=None, help="override the derived subnet CIDR")
 
+    p_capture = sub.add_parser("capture", help="record a live service into a faithful facade")
+    capture_sub = p_capture.add_subparsers(dest="captor", required=True)
+    p_cap_http = capture_sub.add_parser("http", help="crawl a live web server -> http facade")
+    p_cap_http.add_argument("url", help="base URL, e.g. https://10.0.0.5/")
+    p_cap_http.add_argument("-o", "--out", type=Path, default=None)
+    p_cap_http.add_argument("--name", default=None, help="range name")
+    p_cap_http.add_argument("--host-id", default=None)
+    p_cap_http.add_argument("--scrub", action="store_true", help="redact captured secrets")
+    p_cap_http.add_argument("--max", type=int, default=200, help="max paths to probe")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -72,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema": cmd_schema,
         "gen": cmd_gen,
         "import": cmd_import,
+        "capture": cmd_capture,
         "score": cmd_score,
         "run": cmd_run,
         "up": cmd_up,
@@ -124,6 +135,59 @@ def cmd_gen(args) -> int:
     print(
         f"  docker compose -f {compose_path} --profile attacker run --rm attacker"
     )
+    return EXIT_OK
+
+
+def cmd_capture(args) -> int:
+    import ipaddress
+    import re
+    from urllib.parse import urlparse
+
+    if args.captor != "http":
+        print(f"error: unknown captor {args.captor!r}", file=sys.stderr)
+        return EXIT_ERROR
+
+    from rangefinder.capture import capture_http
+
+    try:
+        service, warnings = capture_http(args.url, max_paths=args.max, scrub=args.scrub)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    parsed = urlparse(args.url if "://" in args.url else "http://" + args.url)
+    hostname = parsed.hostname or "target"
+    try:
+        ip = str(ipaddress.ip_address(hostname))
+        subnet = f"{ipaddress.ip_network(ip + '/24', strict=False)}"
+    except ValueError:
+        ip = "10.99.0.10"
+        subnet = "10.99.0.0/24"
+        warnings.append(f"target is a hostname; assigned placeholder IP {ip} (edit as needed)")
+
+    host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.split(".")[0].lower()).strip("-") or "web")
+    name = re.sub(r"[^a-z0-9_-]", "-", (args.name or hostname).lower()).strip("-_") or "captured"
+
+    config = {
+        "name": name[:62],
+        "network": {"subnet": subnet},
+        "hosts": [{"id": host_id[:63], "hostname": hostname, "ip": ip,
+                   "os": "generic_linux", "services": [service]}],
+    }
+    try:
+        RangeConfig.model_validate(config)
+    except Exception as exc:
+        print(f"error: captured config is invalid: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    text = json.dumps(config, indent=2) + "\n"
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    for w in warnings:
+        print(f"note: {w}", file=sys.stderr)
     return EXIT_OK
 
 
