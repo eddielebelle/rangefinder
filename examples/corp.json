@@ -36,11 +36,9 @@
           "close_after_banner": true
         },
         {
-          "type": "banner",
+          "type": "ldap",
           "port": 389,
-          "protocol": "ldap",
-          "banner": "",
-          "close_after_banner": true
+          "allow_anonymous_bind": true
         },
         {
           "type": "banner",

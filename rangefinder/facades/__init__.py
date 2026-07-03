@@ -6,6 +6,7 @@ from rangefinder.facades.registry import build_facade, register, registered_type
 # Import concrete facades for their registration side effects.
 from rangefinder.facades import banner as _banner  # noqa: F401
 from rangefinder.facades import http as _http  # noqa: F401
+from rangefinder.facades import ldap as _ldap  # noqa: F401
 
 __all__ = [
     "Facade",

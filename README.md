@@ -10,10 +10,11 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 
 > **Scope of realism (read this).** rangefinder is *enumeration / version-detection*
 > grade. It does **not** perform real cryptographic handshakes — SSH KEX, TLS, SMB dialect
-> negotiation, LDAP BIND, Kerberos/NTLM — so tools that need a real auth flow
-> (BloodHound, impacket) will fail past the banner **by design**. Planted "vulns" are
-> canned request/response decoys that answer scanners and populate telemetry; they are
-> not exploitable. TCP only (no UDP / `nmap -sU`).
+> negotiation, Kerberos/NTLM — so tools that need a real auth flow (BloodHound, impacket)
+> will fail past the banner **by design**. The LDAP facade speaks real LDAPv3 for
+> enumeration (anonymous bind + search) but does not validate credentials, do SASL/StartTLS,
+> or support writes. Planted "vulns" are canned request/response decoys that answer scanners
+> and populate telemetry; they are not exploitable. TCP only (no UDP / `nmap -sU`).
 
 ## Install
 
@@ -27,9 +28,9 @@ A range config has four parts:
 
 - **network** — the subnet the range lives on.
 - **hosts** — each becomes one container with a static IP; each host has **services**.
-- **services** — a typed, discriminated list. Each `type` maps to a facade. v1 ships
-  `http` and `banner`; `ldap`/`smb`/`dns` are defined in the schema but their facades
-  arrive in v2 (represent those ports as `banner` decoys for now).
+- **services** — a typed, discriminated list. Each `type` maps to a facade. Implemented:
+  `http`, `banner`, `ldap`. `smb`/`dns` are defined in the schema but their facades arrive
+  later (represent those ports as `banner` decoys for now).
 - **identities** / **objectives** — AD users/groups and scenario objectives. Descriptive
   metadata in v1 (the LDAP facade will render `identities` in v2).
 
@@ -39,7 +40,8 @@ A range config has four parts:
 |------|--------|-------|
 | `http` | HTTP/1.1 server | server header, canned route table, planted-vuln routes, HEAD, keep-alive |
 | `banner` | generic TCP banner | server-speaks-first banner for nmap `-sV`; optional line-regex rules. `ssh`/`ftp`/`smtp` are just banner presets |
-| `ldap` `smb` `dns` | *(v2)* | config models exist; use `banner` decoys until the facades ship |
+| `ldap` | LDAPv3 directory | real BER wire protocol; renders `identities` into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. Enumeration-grade (no cred validation / SASL / writes) |
+| `smb` `dns` | *(planned)* | config models exist; use `banner` decoys until the facades ship |
 
 ## CLI
 
@@ -70,6 +72,7 @@ docker compose -f build/docker-compose.yml --profile attacker run --rm attacker
 nmap -sV 10.13.37.0/24
 curl -i http://10.13.37.20/
 dirb http://10.13.37.20/
+ldapsearch -x -H ldap://10.13.37.10 -b "DC=corp,DC=local" -s sub "(objectClass=user)"
 ```
 
 Alternative: expose ports to host loopback instead of using an attacker container. This

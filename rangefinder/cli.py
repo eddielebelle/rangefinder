@@ -135,6 +135,7 @@ def cmd_run(args) -> int:
         host_ip=str(host.ip),
         emitter=emitter,
         config_dir=str(Path(args.config).resolve().parent),
+        identities=cfg.identities,
     )
 
     try:

@@ -12,9 +12,13 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from rangefinder.telemetry import event as ev
 from rangefinder.telemetry.emitter import Emitter
+
+if TYPE_CHECKING:
+    from rangefinder.config.model import Identities
 
 # Benign connection outcomes produced constantly by scanners; not worth logging as errors.
 _BENIGN = (
@@ -34,6 +38,9 @@ class FacadeContext:
     host_ip: str | None
     emitter: Emitter
     config_dir: str  # directory of the config file, for resolving body_file paths
+    # Range-level AD identities, rendered by the LDAP facade. None when the range has no
+    # identities block (facades that don't need it ignore this).
+    identities: "Identities | None" = None
 
 
 @dataclass

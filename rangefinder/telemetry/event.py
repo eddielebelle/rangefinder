@@ -206,6 +206,63 @@ def banner_sent(scope: Any, banner: str) -> dict:
     return _prune(ev)
 
 
+def ldap_bind(
+    scope: Any,
+    *,
+    bind_dn: str,
+    method: str,
+    result_code: str,
+    password: str | None = None,
+) -> dict:
+    outcome = "success" if result_code == "success" else "failure"
+    ev = _envelope(
+        scope.facade,
+        action="ldap_bind",
+        category=["authentication"],
+        etype=["start"],
+        outcome=outcome,
+        src_ip=scope.src_ip,
+        src_port=scope.src_port,
+        conn_id=scope.conn_id,
+    )
+    ev["rangefinder"]["auth"] = {
+        "dn": bind_dn or "(anonymous)",
+        "method": method,
+        "result": result_code,
+        # Captured attempted credential — this is a decoy range, so recording what an
+        # attacker tried is intended telemetry.
+        "password": password,
+    }
+    return _prune(ev)
+
+
+def ldap_search(
+    scope: Any,
+    *,
+    base: str,
+    search_scope: str,
+    filter_str: str,
+    entries: int,
+) -> dict:
+    ev = _envelope(
+        scope.facade,
+        action="ldap_search",
+        category=["network"],
+        etype=["access"],
+        outcome="success",
+        src_ip=scope.src_ip,
+        src_port=scope.src_port,
+        conn_id=scope.conn_id,
+    )
+    ev["rangefinder"]["ldap"] = {
+        "base": base,
+        "scope": search_scope,
+        "filter": filter_str,
+        "entries": entries,
+    }
+    return _prune(ev)
+
+
 def line_received(
     scope: Any, preview: str, matched_rule: str | None, vuln_id: str | None = None
 ) -> dict:
