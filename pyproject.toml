@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rangefinder"
+version = "0.1.0"
+description = "Declarative cyber-range generator: JSON configs become protocol facades that answer real security tooling and emit SIEM-ready telemetry."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Owain Mogford" }]
+dependencies = [
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+rangefinder = "rangefinder.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rangefinder*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

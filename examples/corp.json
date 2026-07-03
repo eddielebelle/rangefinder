@@ -1,0 +1,108 @@
+{
+  "name": "corp",
+  "network": { "subnet": "10.13.37.0/24", "gateway": "10.13.37.1" },
+  "identities": {
+    "domain": "corp.local",
+    "netbios": "CORP",
+    "groups": [
+      { "name": "Domain Admins", "members": ["administrator", "svc-backup"] },
+      { "name": "IT", "members": ["jsmith"] }
+    ],
+    "users": [
+      { "sam": "administrator", "display_name": "Administrator", "groups": ["Domain Admins"] },
+      {
+        "sam": "svc-backup",
+        "display_name": "Backup Service",
+        "upn": "svc-backup@corp.local",
+        "groups": ["Domain Admins"],
+        "description": "svc acct - do not change pw: Winter2024!"
+      },
+      { "sam": "jsmith", "display_name": "Jane Smith", "groups": ["IT"] }
+    ]
+  },
+  "hosts": [
+    {
+      "id": "dc01",
+      "hostname": "DC01",
+      "ip": "10.13.37.10",
+      "os": "windows_server_2022",
+      "tags": ["domain-controller", "crown-jewel"],
+      "services": [
+        {
+          "type": "banner",
+          "port": 53,
+          "protocol": "domain",
+          "banner": "",
+          "close_after_banner": true
+        },
+        {
+          "type": "banner",
+          "port": 389,
+          "protocol": "ldap",
+          "banner": "",
+          "close_after_banner": true
+        },
+        {
+          "type": "banner",
+          "port": 445,
+          "protocol": "microsoft-ds",
+          "banner": "",
+          "close_after_banner": true
+        }
+      ]
+    },
+    {
+      "id": "web01",
+      "hostname": "WEB01",
+      "ip": "10.13.37.20",
+      "os": "ubuntu_22_04",
+      "tags": ["dmz", "web"],
+      "services": [
+        {
+          "type": "banner",
+          "port": 22,
+          "protocol": "ssh",
+          "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.4"
+        },
+        {
+          "type": "http",
+          "port": 80,
+          "server_header": "nginx/1.18.0 (Ubuntu)",
+          "extra_headers": { "X-Powered-By": "PHP/7.4.3" },
+          "default_status": 404,
+          "default_body": "<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>",
+          "paths": {
+            "/": { "body": "<html><head><title>Corp Intranet</title></head><body><h1>Corp Intranet</h1><p>Authorized use only.</p></body></html>" },
+            "/robots.txt": { "content_type": "text/plain; charset=utf-8", "body": "User-agent: *\nDisallow: /admin\nDisallow: /backup\n" },
+            "/admin": { "status": 401, "content_type": "text/html; charset=utf-8", "headers": { "WWW-Authenticate": "Basic realm=\"Admin\"" }, "body": "<h1>401 Unauthorized</h1>" },
+            "/.git/HEAD": { "content_type": "text/plain; charset=utf-8", "body": "ref: refs/heads/main\n", "vuln_id": "exposed-git-dir" }
+          }
+        }
+      ]
+    },
+    {
+      "id": "ws01",
+      "hostname": "WS01",
+      "ip": "10.13.37.50",
+      "os": "windows_10",
+      "tags": ["workstation"],
+      "services": [
+        {
+          "type": "banner",
+          "port": 445,
+          "protocol": "microsoft-ds",
+          "banner": "",
+          "close_after_banner": true
+        }
+      ]
+    }
+  ],
+  "objectives": [
+    {
+      "id": "obj-leaked-cred",
+      "title": "Recover a domain admin credential",
+      "description": "A service account password is exposed in a directory attribute and in web content.",
+      "hints": ["Enumerate the web server for exposed files", "Read user description attributes"]
+    }
+  ]
+}
