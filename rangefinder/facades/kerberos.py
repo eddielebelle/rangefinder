@@ -142,7 +142,7 @@ class KerberosFacade(Facade):
         # Known account, but not roastable (no key, or pre-auth genuinely required).
         if acct.password is None or (not acct.no_preauth and not has_preauth):
             self._emit_error(src_ip, src_port, user, "preauth_required")
-            return self._build_error(self._k.KDC_ERR_PREAUTH_REQUIRED, realm, user)
+            return self._build_preauth_required(realm, user)
 
         etype = _choose_etype(etypes)
         roastable = acct.no_preauth and not has_preauth
@@ -346,7 +346,35 @@ class KerberosFacade(Facade):
         asrep["enc-part"]["cipher"] = enc_cipher
         return k.encoder.encode(asrep)
 
-    def _build_error(self, error_code: int, realm: str, sname: str) -> bytes:
+    def _build_preauth_required(self, realm: str, user: str) -> bytes:
+        """KDC_ERR_PREAUTH_REQUIRED carrying PA-ETYPE-INFO2 (the salt), so an AES client
+        derives the same key we encrypt with. Without this, only RC4 (saltless) works."""
+        k = self._k
+        salt = self.realm + user  # AD salt convention: UPPERCASE-REALM + sAMAccountName
+
+        info = k.ETYPE_INFO2()
+        for i, et in enumerate((_AES256, _AES128)):
+            entry = k.ETYPE_INFO2_ENTRY()
+            entry["etype"] = et
+            entry["salt"] = salt
+            info.setComponentByPosition(i, entry)
+        rc4 = k.ETYPE_INFO2_ENTRY()  # RC4 last, no salt
+        rc4["etype"] = _RC4
+        info.setComponentByPosition(2, rc4)
+
+        md = k.METHOD_DATA()
+        pa_info = k.PA_DATA()
+        pa_info["padata-type"] = k.PA_ETYPE_INFO2
+        pa_info["padata-value"] = k.encoder.encode(info)
+        pa_ts = k.PA_DATA()
+        pa_ts["padata-type"] = k.PA_ENC_TIMESTAMP
+        pa_ts["padata-value"] = b""
+        md.setComponentByPosition(0, pa_ts)
+        md.setComponentByPosition(1, pa_info)
+
+        return self._build_error(k.KDC_ERR_PREAUTH_REQUIRED, realm, user, e_data=k.encoder.encode(md))
+
+    def _build_error(self, error_code: int, realm: str, sname: str, e_data: bytes | None = None) -> bytes:
         k = self._k
         now = datetime.datetime.now(datetime.timezone.utc)
         err = k.KRB_ERROR()
@@ -357,6 +385,8 @@ class KerberosFacade(Facade):
         err["error-code"] = int(error_code)
         err["realm"] = realm
         k.seq_set(err, "sname", k.Principal("krbtgt/%s" % realm, type=k.NT_SRV_INST).components_to_asn1)
+        if e_data is not None:
+            err["e-data"] = e_data
         return k.encoder.encode(err)
 
 
@@ -387,8 +417,9 @@ def _load_krb5() -> SimpleNamespace:
 
     from impacket.krb5 import constants
     from impacket.krb5.asn1 import (
-        AP_REQ, AS_REP, AS_REQ, Authenticator, EncASRepPart, EncTGSRepPart,
-        EncTicketPart, KRB_ERROR, TGS_REP, TGS_REQ, seq_set,
+        AP_REQ, AS_REP, AS_REQ, Authenticator, ETYPE_INFO2, ETYPE_INFO2_ENTRY,
+        EncASRepPart, EncTGSRepPart, EncTicketPart, KRB_ERROR, METHOD_DATA, PA_DATA,
+        TGS_REP, TGS_REQ, seq_set,
     )
     from impacket.krb5.crypto import Key, _enctype_table, string_to_key
     from impacket.krb5.types import KerberosTime, Principal
@@ -398,6 +429,10 @@ def _load_krb5() -> SimpleNamespace:
         AS_REQ=AS_REQ, AS_REP=AS_REP, TGS_REQ=TGS_REQ, TGS_REP=TGS_REP, AP_REQ=AP_REQ,
         Authenticator=Authenticator, EncASRepPart=EncASRepPart, EncTGSRepPart=EncTGSRepPart,
         EncTicketPart=EncTicketPart, KRB_ERROR=KRB_ERROR, seq_set=seq_set,
+        ETYPE_INFO2=ETYPE_INFO2, ETYPE_INFO2_ENTRY=ETYPE_INFO2_ENTRY,
+        METHOD_DATA=METHOD_DATA, PA_DATA=PA_DATA,
+        PA_ETYPE_INFO2=int(constants.PreAuthenticationDataTypes.PA_ETYPE_INFO2.value),
+        PA_ENC_TIMESTAMP=int(constants.PreAuthenticationDataTypes.PA_ENC_TIMESTAMP.value),
         string_to_key=string_to_key, enctypes=_enctype_table, Key=Key,
         Principal=Principal, KerberosTime=KerberosTime,
         NT_PRINCIPAL=constants.PrincipalNameType.NT_PRINCIPAL.value,
