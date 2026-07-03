@@ -1,4 +1,5 @@
 from rangefinder.capture.http import capture_http
 from rangefinder.capture.ldap import capture_ldap
+from rangefinder.capture.smb import capture_smb
 
-__all__ = ["capture_http", "capture_ldap"]
+__all__ = ["capture_http", "capture_ldap", "capture_smb"]

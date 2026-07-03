@@ -71,6 +71,17 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_ldap.add_argument("--host-id", default=None)
     p_cap_ldap.add_argument("--scrub", action="store_true", help="redact secret attributes")
 
+    p_cap_smb = capture_sub.add_parser("smb", help="enumerate live shares -> smb facade")
+    p_cap_smb.add_argument("host", help="host or IP")
+    p_cap_smb.add_argument("--port", type=int, default=445)
+    p_cap_smb.add_argument("--username", default="", help="username (default: null session)")
+    p_cap_smb.add_argument("--password", default="")
+    p_cap_smb.add_argument("--domain", default="")
+    p_cap_smb.add_argument("-o", "--out", type=Path, default=None)
+    p_cap_smb.add_argument("--name", default=None, help="range name")
+    p_cap_smb.add_argument("--host-id", default=None)
+    p_cap_smb.add_argument("--scrub", action="store_true", help="redact captured secrets")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -179,6 +190,19 @@ def cmd_capture(args) -> int:
             print(f"error: LDAP capture failed: {exc}", file=sys.stderr)
             return EXIT_ERROR
         default_id = "dc"
+    elif args.captor == "smb":
+        from rangefinder.capture import capture_smb
+
+        hostname = args.host
+        try:
+            service, warnings = capture_smb(
+                hostname, args.port, username=args.username,
+                password=args.password, domain=args.domain, scrub=args.scrub,
+            )
+        except Exception as exc:  # impacket raises many exception types
+            print(f"error: SMB capture failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        default_id = "fs"
     else:
         print(f"error: unknown captor {args.captor!r}", file=sys.stderr)
         return EXIT_ERROR
