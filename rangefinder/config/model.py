@@ -146,9 +146,9 @@ class RangeConfig(BaseModel):
                     f"host {host.id!r}: ip {host.ip} collides with the gateway"
                 )
 
-            # ldap/smb facades render AD identities; require them to be present.
+            # The ldap facade renders AD identities; require them to be present.
             for svc in host.services:
-                if svc.type in ("ldap", "smb") and self.identities is None:
+                if svc.type == "ldap" and self.identities is None:
                     raise ValueError(
                         f"host {host.id!r}: {svc.type!r} service requires top-level "
                         f"'identities' to be defined"

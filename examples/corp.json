@@ -41,11 +41,19 @@
           "allow_anonymous_bind": true
         },
         {
-          "type": "banner",
+          "type": "smb",
           "port": 445,
-          "protocol": "microsoft-ds",
-          "banner": "",
-          "close_after_banner": true
+          "server_os": "Windows Server 2022 Standard 20348",
+          "shares": [
+            { "name": "SYSVOL", "comment": "Logon server share", "readonly": true,
+              "files": { "corp.local/scripts/mapdrives.bat": "net use H: \\\\dc01\\home /persistent:yes\r\n" } },
+            { "name": "NETLOGON", "comment": "Logon server share", "readonly": true },
+            { "name": "backups", "comment": "Nightly backup drop", "readonly": true,
+              "files": {
+                "README.txt": "Nightly SQL backups land here. Restore runs as svc-backup.\n",
+                "db/connstrings.txt": "server=DC01;uid=svc-backup;pwd=Winter2024!\n"
+              } }
+          ]
         }
       ]
     },

@@ -9,12 +9,14 @@ just facades that respond convincingly enough to test against, and log everythin
 Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-teamers.
 
 > **Scope of realism (read this).** rangefinder is *enumeration / version-detection*
-> grade. It does **not** perform real cryptographic handshakes — SSH KEX, TLS, SMB dialect
-> negotiation, Kerberos/NTLM — so tools that need a real auth flow (BloodHound, impacket)
-> will fail past the banner **by design**. The LDAP facade speaks real LDAPv3 for
-> enumeration (anonymous bind + search) but does not validate credentials, do SASL/StartTLS,
-> or support writes. Planted "vulns" are canned request/response decoys that answer scanners
-> and populate telemetry; they are not exploitable. TCP only (no UDP / `nmap -sU`).
+> grade. It does **not** validate credentials or complete real domain auth (Kerberos/NTLM
+> single sign-on), so tools that pivot on authenticated domain access (BloodHound
+> collection, secretsdump) will not complete **by design**. The **LDAP** facade speaks real
+> LDAPv3 for enumeration (anonymous bind + search) but has no SASL/StartTLS or writes. The
+> **SMB** facade (impacket-backed) serves the configured shares as real files and captures
+> NTLM auth attempts without validating them (`readonly` is advisory). Planted "vulns" are
+> canned decoys that answer scanners and populate telemetry; they are not exploitable. TCP
+> only (no UDP / `nmap -sU`).
 
 ## Install
 
@@ -29,8 +31,8 @@ A range config has four parts:
 - **network** — the subnet the range lives on.
 - **hosts** — each becomes one container with a static IP; each host has **services**.
 - **services** — a typed, discriminated list. Each `type` maps to a facade. Implemented:
-  `http`, `banner`, `ldap`. `smb`/`dns` are defined in the schema but their facades arrive
-  later (represent those ports as `banner` decoys for now).
+  `http`, `banner`, `ldap`, `smb`. `dns` is defined in the schema but its facade arrives
+  later (represent that port as a `banner` decoy for now).
 - **identities** / **objectives** — AD users/groups and scenario objectives. Descriptive
   metadata in v1 (the LDAP facade will render `identities` in v2).
 
@@ -41,7 +43,8 @@ A range config has four parts:
 | `http` | HTTP/1.1 server | server header, canned route table, planted-vuln routes, HEAD, keep-alive |
 | `banner` | generic TCP banner | server-speaks-first banner for nmap `-sV`; optional line-regex rules. `ssh`/`ftp`/`smtp` are just banner presets |
 | `ldap` | LDAPv3 directory | real BER wire protocol; renders `identities` into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. Enumeration-grade (no cred validation / SASL / writes) |
-| `smb` `dns` | *(planned)* | config models exist; use `banner` decoys until the facades ship |
+| `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
+| `dns` | *(planned)* | config model exists; use a `banner` decoy until the facade ships |
 
 ## CLI
 
@@ -73,6 +76,7 @@ nmap -sV 10.13.37.0/24
 curl -i http://10.13.37.20/
 dirb http://10.13.37.20/
 ldapsearch -x -H ldap://10.13.37.10 -b "DC=corp,DC=local" -s sub "(objectClass=user)"
+smbclient -N -L //10.13.37.10          # list shares; then //10.13.37.10/BACKUPS to browse
 ```
 
 Alternative: expose ports to host loopback instead of using an attacker container. This

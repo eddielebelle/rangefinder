@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -77,14 +78,18 @@ class Emitter:
 
     def __init__(self, sinks: list[Sink]) -> None:
         self._sinks = sinks
+        # The SMB facade emits from impacket's per-connection threads, so guard writes
+        # to keep JSON lines from interleaving with the asyncio facades' events.
+        self._lock = threading.Lock()
 
     def emit(self, event: dict) -> None:
-        for sink in self._sinks:
-            try:
-                sink.write(event)
-            except Exception:
-                # Telemetry must never take down a facade. Swallow sink failures.
-                pass
+        with self._lock:
+            for sink in self._sinks:
+                try:
+                    sink.write(event)
+                except Exception:
+                    # Telemetry must never take down a facade. Swallow sink failures.
+                    pass
 
     def close(self) -> None:
         for sink in self._sinks:

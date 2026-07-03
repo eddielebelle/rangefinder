@@ -140,4 +140,4 @@ BuiltinService = Annotated[
 ]
 
 # Service types that have a working runtime facade in this release.
-IMPLEMENTED_TYPES = frozenset({"http", "banner", "ldap"})
+IMPLEMENTED_TYPES = frozenset({"http", "banner", "ldap", "smb"})

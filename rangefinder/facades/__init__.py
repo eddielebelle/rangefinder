@@ -7,6 +7,7 @@ from rangefinder.facades.registry import build_facade, register, registered_type
 from rangefinder.facades import banner as _banner  # noqa: F401
 from rangefinder.facades import http as _http  # noqa: F401
 from rangefinder.facades import ldap as _ldap  # noqa: F401
+from rangefinder.facades import smb as _smb  # noqa: F401
 
 __all__ = [
     "Facade",

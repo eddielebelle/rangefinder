@@ -263,6 +263,40 @@ def ldap_search(
     return _prune(ev)
 
 
+def smb_event(
+    facade: Any,
+    action: str,
+    *,
+    category: list[str],
+    etype: list[str],
+    kind: str = "event",
+    outcome: str = "unknown",
+    src_ip: str | None = None,
+    src_port: int | None = None,
+    conn_id: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """Build an SMB telemetry event from parsed impacket log records.
+
+    Unlike the asyncio facades, the SMB facade has no ConnScope — it passes the facade
+    plus fields parsed out of impacket's server log directly.
+    """
+    ev = _envelope(
+        facade,
+        action=action,
+        category=category,
+        etype=etype,
+        kind=kind,
+        outcome=outcome,
+        src_ip=src_ip,
+        src_port=src_port,
+        conn_id=conn_id,
+    )
+    if extra:
+        ev["rangefinder"].update(extra)
+    return _prune(ev)
+
+
 def line_received(
     scope: Any, preview: str, matched_rule: str | None, vuln_id: str | None = None
 ) -> dict:
