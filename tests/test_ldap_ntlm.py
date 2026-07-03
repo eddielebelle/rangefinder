@@ -77,3 +77,29 @@ def test_ldap_ntlm_spnego_wrong_password():
     assert rc == 49  # invalidCredentials
     assert any(e["event"]["action"] == "ldap_bind" and e["rangefinder"]["auth"]["result"] == "invalidCredentials"
                for e in sink.events)
+
+
+def test_simple_bind_validates_known_users():
+    """A known identity's wrong password must be rejected (like a real DC); unknown users and
+    anonymous stay permissive so captured-directory replay keeps working."""
+    import asyncio
+
+    from pyasn1_modules import rfc2251 as L
+
+    facade, _ = _facade()  # identities: svc-web / Autumn2025!
+    scope = ConnScope(facade, "10.0.0.9", 5001)
+
+    def simple_bind(dn, pw):
+        br = L.BindRequest()
+        br["version"] = 3
+        br["name"] = dn
+        br["authentication"]["simple"] = pw.encode()
+        w = _FakeWriter()
+        asyncio.run(facade._handle_bind(scope, w, 7, br))
+        return _bind_result(w.buf)[0]
+
+    assert simple_bind("svc-web@acme.corp", "Autumn2025!") == 0    # correct -> success
+    assert simple_bind("svc-web@acme.corp", "WrongPass!") == 49    # wrong -> invalidCredentials
+    assert simple_bind("cn=svc-web,cn=users,dc=acme,dc=corp", "x") == 49  # DN form, wrong
+    assert simple_bind("cn=nobody,dc=acme,dc=corp", "whatever") == 0      # unknown -> permissive
+    assert simple_bind("", "") == 0                                # anonymous -> success

@@ -8,9 +8,11 @@ substrings), and logs every bind and search.
 
 It also validates NTLM binds: SASL GSS-SPNEGO (what GetUserSPNs / BloodHound use) and the
 legacy MS Sicily mechanism both run the NTLM challenge/response against the ``identities``
-NT hashes. Deliberate limits: simple binds are unvalidated (anonymous succeeds; attempted
-credentials are captured), no NTLM signing/sealing on the post-bind session, no writes,
-no StartTLS, no paged-results control. It renders a directory for enumeration.
+NT hashes. Simple binds are validated against known identity passwords (a wrong password
+for a known user returns invalidCredentials, like a real DC); a captured directory holds no
+passwords, so simple binds there stay permissive to keep replay working. Deliberate limits:
+no NTLM signing/sealing on the post-bind session, no writes, no StartTLS, no paged-results
+control. It renders a directory for enumeration.
 """
 
 from __future__ import annotations
@@ -287,6 +289,19 @@ def _octets(value) -> str:
         return str(value)
 
 
+def _bind_user(bind_dn: str) -> str:
+    """Extract the sAMAccountName from a bind DN — UPN (user@dom), DOMAIN\\user, or a DN
+    whose leftmost RDN is the account (cn=user,...). Lowercased to match the password map."""
+    s = bind_dn.strip()
+    if "@" in s:
+        return s.split("@", 1)[0].lower()
+    if "\\" in s:
+        return s.split("\\", 1)[1].lower()
+    if "=" in s:
+        return s.split(",", 1)[0].split("=", 1)[1].strip().lower()
+    return s.lower()
+
+
 def filter_to_str(f) -> str:
     try:
         name = f.getName()
@@ -501,10 +516,21 @@ class LdapFacade(Facade):
             password = _octets(auth["simple"])
 
         anonymous = not bind_dn and not password
-        if anonymous and not self.cfg.allow_anonymous_bind:
-            result = "inappropriateAuthentication"
+        if anonymous:
+            result = "success" if self.cfg.allow_anonymous_bind else "inappropriateAuthentication"
+        elif method == "simple":
+            # Validate against a known credential when we have one (identities-rendered users):
+            # a real DC returns invalidCredentials for a wrong password, and answering
+            # "success" to any password is both wrong and an obvious decoy tell. For captured
+            # directories we hold no passwords, so stay permissive there (else replay breaks).
+            known = self._passwords.get(_bind_user(bind_dn))
+            if known is None:
+                result = "success"
+            elif password == known:
+                result = "success"
+            else:
+                result = "invalidCredentials"
         else:
-            # Decoy: never validates credentials; any bind "succeeds".
             result = "success"
 
         br = L.BindResponse()

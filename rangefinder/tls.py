@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import atexit
 import datetime
+import hashlib
 import ipaddress
 import os
 import ssl
@@ -36,14 +37,19 @@ def _make_cert(common_name: str, sans: list[str]) -> tuple[bytes, bytes]:
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.datetime.now(datetime.timezone.utc)
     alt_names = [_san_entry(n) for n in dict.fromkeys([common_name, *sans])]
+    # Backdate issuance to a stable-per-host point 3-15 months ago so the cert reads as a
+    # mid-life internal cert, not one minted at range boot (a freshly-dated cert is a tell) —
+    # and skew the time-of-day per host so certs don't all share one batch-minted timestamp.
+    h = int(hashlib.sha256(common_name.encode()).hexdigest(), 16)
+    not_before = now - datetime.timedelta(days=90 + h % 360, seconds=(h // 360) % 86_400)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=825))
+        .not_valid_before(not_before)
+        .not_valid_after(not_before + datetime.timedelta(days=825))
         .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
