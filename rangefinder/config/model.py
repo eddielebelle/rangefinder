@@ -79,6 +79,36 @@ class Identities(BaseModel):
         return ",".join(f"DC={part}" for part in self.domain.split("."))
 
 
+class Condition(BaseModel):
+    """A single field predicate over a telemetry event.
+
+    ``field`` is a dotted path into the event (ECS names), e.g. ``event.action``,
+    ``url.path``, ``rangefinder.smb.path``, ``source.ip``. Exactly one matcher applies.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    equals: str | None = None
+    contains: str | None = None  # case-insensitive substring
+    regex: str | None = None
+
+    @model_validator(mode="after")
+    def _needs_matcher(self) -> "Condition":
+        if self.equals is None and self.contains is None and self.regex is None:
+            raise ValueError(f"condition on {self.field!r} needs one of equals/contains/regex")
+        return self
+
+
+class Signal(BaseModel):
+    """One way an objective can be satisfied: all conditions hold on a single event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = None
+    all: list[Condition] = Field(min_length=1)
+
+
 class Objective(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -86,6 +116,9 @@ class Objective(BaseModel):
     title: str
     description: str
     hints: list[str] = Field(default_factory=list)
+    # An objective is MET when any of its signals matches any telemetry event. Empty =
+    # descriptive only (reported as UNSCORED by the scorer).
+    detect: list[Signal] = Field(default_factory=list)
 
 
 class Network(BaseModel):

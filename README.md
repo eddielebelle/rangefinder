@@ -55,6 +55,7 @@ A range config has four parts:
 rangefinder validate examples/corp.json     # validate + summarize (exit 2 on error)
 rangefinder schema -o range.schema.json      # export JSON Schema for editor autocomplete
 rangefinder gen examples/corp.json -o build/ # emit build/docker-compose.yml + config.json
+rangefinder score examples/acme.json log.jsonl   # score objectives against a telemetry log
 rangefinder run --host web01 --config examples/corp.json   # serve one host (container entrypoint)
 rangefinder up   -o build/                   # docker compose up -d  (thin wrapper)
 rangefinder down -o build/                   # docker compose down
@@ -107,14 +108,50 @@ Example event (an HTTP hit on a planted vuln):
 "rangefinder":{"vuln_id":"exposed-git-dir","conn_id":"..."}}
 ```
 
+## Scoring
+
+Scoring is a **separate reader** of the telemetry — the facades keep emitting the full
+logs; the scorer just evaluates them, so you keep both. Each `objective` can carry a
+`detect` rule: a list of **signals**, where the objective is MET when any signal's
+conditions all hold on a single event. Conditions match a dotted event field with
+`equals` / `contains` / `regex`:
+
+```json
+{ "id": "obj-svc-sql-cred", "title": "Recover the svc-sql credential",
+  "description": "Exposed via a web config and an SMB share.",
+  "detect": [
+    { "label": "read the exposed web db.config",
+      "all": [ { "field": "event.action", "equals": "http_request" },
+               { "field": "url.path", "contains": "/backup/db.config" } ] },
+    { "label": "read the IT credential vault over SMB",
+      "all": [ { "field": "event.action", "equals": "smb_file_access" },
+               { "field": "rangefinder.smb.path", "contains": "vault-export" } ] }
+  ] }
+```
+
+Run it against a captured log (a file, or piped from `docker compose logs`):
+
+```bash
+docker compose -f build/docker-compose.yml logs | rangefinder score examples/acme.json -
+# [MET  ] obj-svc-sql-cred — first via "read the exposed web db.config" by 10.20.0.2 (http_request)
+# [UNMET] obj-ssh-foothold
+# Summary: 1/4 objectives met
+```
+
+The report gives, per objective, the first matching event (when, source IP, action), the
+signal that fired, and how many events matched from which sources. Objectives with no
+`detect` are reported `UNSCORED`. Use `--json` for machine output. (v1 matches within a
+single event; cross-event sequences are a future enhancement.)
+
 ## Architecture
 
 ```
 config/       pydantic models; JSON is the single source of truth (discriminated union on `type`)
-facades/      registry + Facade base + http/banner facades (stdlib asyncio, per-connection ConnScope)
+facades/      registry + Facade base + http/banner/ssh/ldap/smb/dns facades
 telemetry/    ECS-aligned event builders + stdout/file/list sinks
 runtime/      per-host supervisor: serve all facades in one loop, graceful SIGTERM shutdown
 orchestrate/  config -> docker-compose (JSON-as-YAML, static IPs, attacker profile)
+scoring.py    offline objective scorer over the telemetry log
 ```
 
 ## Extending

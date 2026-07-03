@@ -179,9 +179,37 @@
   ],
   "objectives": [
     { "id": "obj-svc-sql-cred", "title": "Recover the svc-sql credential",
-      "description": "The svc-sql password is exposed in multiple places (LDAP description, an exposed web config, and an IT share).",
-      "hints": ["Anonymous LDAP", "Web content under /backup", "SMB IT share"] },
-    { "id": "obj-hr-data", "title": "Access HR data",
-      "description": "The HR share on FS01 exposes salary data over a null session." }
+      "description": "The svc-sql password is exposed in multiple places (an exposed web config and the IT share).",
+      "hints": ["Web content under /backup", "SMB IT share"],
+      "detect": [
+        { "label": "read the exposed web db.config",
+          "all": [ { "field": "event.action", "equals": "http_request" },
+                   { "field": "url.path", "contains": "/backup/db.config" } ] },
+        { "label": "read the IT credential vault over SMB",
+          "all": [ { "field": "event.action", "equals": "smb_file_access" },
+                   { "field": "rangefinder.smb.path", "contains": "vault-export" } ] }
+      ] },
+    { "id": "obj-hr-data", "title": "Access HR salary data",
+      "description": "The HR share on FS01 exposes salary data over a null session.",
+      "detect": [
+        { "label": "read HR salaries over SMB",
+          "all": [ { "field": "event.action", "equals": "smb_file_access" },
+                   { "field": "rangefinder.smb.path", "contains": "salaries" } ] }
+      ] },
+    { "id": "obj-ssh-foothold", "title": "Gain an SSH foothold",
+      "description": "A weak credential on the bastion (jump01) grants interactive SSH access.",
+      "detect": [
+        { "label": "successful SSH login",
+          "all": [ { "field": "event.action", "equals": "ssh_auth" },
+                   { "field": "event.outcome", "equals": "success" } ] }
+      ] },
+    { "id": "obj-admin-panel", "title": "Break into the web admin panel",
+      "description": "The /admin panel accepts a weak Basic-auth credential.",
+      "detect": [
+        { "label": "authenticated to /admin",
+          "all": [ { "field": "event.action", "equals": "http_auth" },
+                   { "field": "url.path", "contains": "/admin" },
+                   { "field": "event.outcome", "equals": "success" } ] }
+      ] }
   ]
 }

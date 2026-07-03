@@ -42,6 +42,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-attacker", action="store_true", help="omit the attacker container"
     )
 
+    p_score = sub.add_parser("score", help="score objectives against a telemetry log")
+    p_score.add_argument("config", type=Path)
+    p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
+    p_score.add_argument("--json", action="store_true", help="emit results as JSON")
+
     p_run = sub.add_parser("run", help="serve a host's facades (container entrypoint)")
     p_run.add_argument("--host", required=True)
     p_run.add_argument("--config", required=True, type=Path)
@@ -58,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         "validate": cmd_validate,
         "schema": cmd_schema,
         "gen": cmd_gen,
+        "score": cmd_score,
         "run": cmd_run,
         "up": cmd_up,
         "down": cmd_down,
@@ -109,6 +115,49 @@ def cmd_gen(args) -> int:
     print(
         f"  docker compose -f {compose_path} --profile attacker run --rm attacker"
     )
+    return EXIT_OK
+
+
+def cmd_score(args) -> int:
+    import dataclasses
+
+    from rangefinder.scoring import parse_events, score
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+
+    if args.log == "-":
+        events = parse_events(sys.stdin)
+    else:
+        try:
+            with open(args.log, encoding="utf-8", errors="replace") as fh:
+                events = parse_events(fh)
+        except OSError as exc:
+            print(f"error: cannot read log {args.log}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    results = score(cfg, events)
+
+    if args.json:
+        print(json.dumps([dataclasses.asdict(r) for r in results], indent=2))
+        return EXIT_OK
+
+    scoreable = [r for r in results if r.scoreable]
+    met = [r for r in scoreable if r.met]
+    print(f"Scoring: {cfg.name}   ({len(events)} events, {len(scoreable)} scoreable objectives)")
+    print()
+    for r in results:
+        tag = "UNSCORED" if not r.scoreable else ("MET" if r.met else "UNMET")
+        print(f"  [{tag:8}] {r.id}  —  {r.title}")
+        if r.met:
+            via = f' via "{r.signal}"' if r.signal else ""
+            print(f"             first{via} at {r.timestamp} by {r.source_ip} ({r.action})")
+            print(f"             {r.match_count} matching event(s) from {', '.join(r.source_ips) or 'n/a'}")
+    print()
+    print(f"Summary: {len(met)}/{len(scoreable)} objectives met")
     return EXIT_OK
 
 
