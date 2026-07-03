@@ -21,7 +21,8 @@ from rangefinder.config.services import BuiltinService
 # Machine-generated configs (capture/import) stamp it; the loader refuses a config stamped
 # newer than the runtime supports, turning "stale image" into a clear, actionable error
 # instead of a cryptic field-rejection deep inside a container.
-SCHEMA_VERSION = 1
+# v2: added Objective.sequence (kill-chain scoring).
+SCHEMA_VERSION = 2
 
 
 class OS(str, Enum):
@@ -117,6 +118,21 @@ class Signal(BaseModel):
     all: list[Condition] = Field(min_length=1)
 
 
+class Sequence(BaseModel):
+    """An ordered multi-event kill chain: steps that must occur in order.
+
+    Each step is a Signal (conditions on one event). By default all steps must be by the
+    same source (``same_source``); ``within`` optionally bounds the elapsed time from the
+    first step to the last (e.g. "10m", "1h").
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[Signal] = Field(min_length=1)
+    same_source: bool = True
+    within: str | None = None
+
+
 class Objective(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -124,9 +140,11 @@ class Objective(BaseModel):
     title: str
     description: str
     hints: list[str] = Field(default_factory=list)
-    # An objective is MET when any of its signals matches any telemetry event. Empty =
-    # descriptive only (reported as UNSCORED by the scorer).
+    # MET when any signal matches any single event (single-event detection).
     detect: list[Signal] = Field(default_factory=list)
+    # MET when an ordered kill chain occurs (cross-event detection). An objective may use
+    # detect, sequence, or both (met if either fires). Neither = descriptive (UNSCORED).
+    sequence: Sequence | None = None
 
 
 class Network(BaseModel):

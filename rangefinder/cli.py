@@ -317,7 +317,12 @@ def cmd_score(args) -> int:
     for r in results:
         tag = "UNSCORED" if not r.scoreable else ("MET" if r.met else "UNMET")
         print(f"  [{tag:8}] {r.id}  —  {r.title}")
-        if r.met:
+        if r.met and r.kind == "sequence":
+            print(f"             kill chain completed at {r.timestamp} by {r.source_ip}:")
+            for i, step in enumerate(r.chain, 1):
+                label = step.get("label") or step.get("action")
+                print(f"               {i}. {label}  at {step['timestamp']} ({step['action']})")
+        elif r.met:
             via = f' via "{r.signal}"' if r.signal else ""
             print(f"             first{via} at {r.timestamp} by {r.source_ip} ({r.action})")
             print(f"             {r.match_count} matching event(s) from {', '.join(r.source_ips) or 'n/a'}")

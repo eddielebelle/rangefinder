@@ -64,6 +64,81 @@ def test_unmet_and_unscored():
     assert results["obj-none"].met is False
 
 
+def _seq_config(**seq):
+    base_seq = {"same_source": True, "steps": [
+        {"label": "foothold", "all": [{"field": "event.action", "equals": "ssh_auth"},
+                                      {"field": "event.outcome", "equals": "success"}]},
+        {"label": "loot", "all": [{"field": "event.action", "equals": "smb_file_access"}]},
+    ]}
+    base_seq.update(seq)
+    return RangeConfig.model_validate({
+        "name": "r", "network": {"subnet": "10.0.0.0/24"},
+        "hosts": [{"id": "h1", "hostname": "H1", "ip": "10.0.0.10",
+                   "services": [{"type": "http", "port": 80}]}],
+        "objectives": [{"id": "kc", "title": "Kill chain", "description": "d", "sequence": base_seq}],
+    })
+
+
+def _at(ts, action, ip, **extra):
+    e = {"@timestamp": ts, "event": {"action": action}, "source": {"ip": ip}}
+    if "outcome" in extra:
+        e["event"]["outcome"] = extra["outcome"]
+    return e
+
+
+def test_sequence_met_in_order_same_source():
+    cfg = _seq_config()
+    events = [
+        _at("2026-07-03T10:00:01.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+        _at("2026-07-03T10:00:05.000Z", "smb_file_access", "10.0.0.9"),
+    ]
+    r = {x.id: x for x in score(cfg, events)}["kc"]
+    assert r.met and r.kind == "sequence"
+    assert r.source_ip == "10.0.0.9"
+    assert [s["label"] for s in r.chain] == ["foothold", "loot"]
+
+
+def test_sequence_not_met_out_of_order():
+    cfg = _seq_config()
+    events = [
+        _at("2026-07-03T10:00:01.000Z", "smb_file_access", "10.0.0.9"),  # loot before foothold
+        _at("2026-07-03T10:00:05.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+    ]
+    assert {x.id: x for x in score(cfg, events)}["kc"].met is False
+
+
+def test_sequence_requires_same_source():
+    cfg = _seq_config()
+    events = [
+        _at("2026-07-03T10:00:01.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+        _at("2026-07-03T10:00:05.000Z", "smb_file_access", "10.0.0.8"),  # different attacker
+    ]
+    assert {x.id: x for x in score(cfg, events)}["kc"].met is False
+
+
+def test_sequence_cross_source_when_allowed():
+    cfg = _seq_config(same_source=False)
+    events = [
+        _at("2026-07-03T10:00:01.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+        _at("2026-07-03T10:00:05.000Z", "smb_file_access", "10.0.0.8"),
+    ]
+    assert {x.id: x for x in score(cfg, events)}["kc"].met is True
+
+
+def test_sequence_within_window():
+    cfg = _seq_config(within="30s")
+    too_slow = [
+        _at("2026-07-03T10:00:00.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+        _at("2026-07-03T10:05:00.000Z", "smb_file_access", "10.0.0.9"),  # 5 min later
+    ]
+    assert {x.id: x for x in score(cfg, too_slow)}["kc"].met is False
+    in_time = [
+        _at("2026-07-03T10:00:00.000Z", "ssh_auth", "10.0.0.9", outcome="success"),
+        _at("2026-07-03T10:00:20.000Z", "smb_file_access", "10.0.0.9"),
+    ]
+    assert {x.id: x for x in score(cfg, in_time)}["kc"].met is True
+
+
 def test_parse_events_tolerates_docker_prefix():
     lines = [
         'acme-web01  | {"@timestamp":"2026-07-03T10:00:00.000Z","event":{"action":"http_request"}}',

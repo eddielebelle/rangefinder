@@ -195,8 +195,38 @@ docker compose -f build/docker-compose.yml logs | rangefinder score examples/acm
 
 The report gives, per objective, the first matching event (when, source IP, action), the
 signal that fired, and how many events matched from which sources. Objectives with no
-`detect` are reported `UNSCORED`. Use `--json` for machine output. (v1 matches within a
-single event; cross-event sequences are a future enhancement.)
+`detect` are reported `UNSCORED`. Use `--json` for machine output.
+
+### Kill chains (cross-event)
+
+Beyond single-event `detect`, an objective can carry a `sequence` — an ordered set of
+steps that must occur **in order**, by default by the **same source**, optionally within a
+time window. This scores multi-stage attacks ("authenticated *then* read the file"):
+
+```json
+{ "id": "obj-killchain", "title": "Foothold then data theft",
+  "description": "The same attacker gains SSH access and then reads files over SMB.",
+  "sequence": {
+    "same_source": true, "within": "10m",
+    "steps": [
+      { "label": "SSH foothold",
+        "all": [ { "field": "event.action", "equals": "ssh_auth" },
+                 { "field": "event.outcome", "equals": "success" } ] },
+      { "label": "read a file over SMB",
+        "all": [ { "field": "event.action", "equals": "smb_file_access" } ] }
+    ] } }
+```
+
+A met sequence prints the chain as a per-attacker narrative:
+
+```
+[MET] obj-killchain — Foothold then data theft
+       kill chain completed at 2026-… by 10.20.0.2:
+         1. SSH foothold          at 2026-…:12 (ssh_auth)
+         2. read a file over SMB  at 2026-…:13 (smb_file_access)
+```
+
+(An objective may use `detect`, `sequence`, or both — met if either fires.)
 
 ## Architecture
 

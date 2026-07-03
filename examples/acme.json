@@ -210,6 +210,18 @@
           "all": [ { "field": "event.action", "equals": "http_auth" },
                    { "field": "url.path", "contains": "/admin" },
                    { "field": "event.outcome", "equals": "success" } ] }
-      ] }
+      ] },
+    { "id": "obj-killchain", "title": "Foothold then data theft",
+      "description": "The same attacker gains an SSH foothold and then reads sensitive files over SMB.",
+      "sequence": {
+        "same_source": true,
+        "steps": [
+          { "label": "SSH foothold",
+            "all": [ { "field": "event.action", "equals": "ssh_auth" },
+                     { "field": "event.outcome", "equals": "success" } ] },
+          { "label": "read a file over SMB",
+            "all": [ { "field": "event.action", "equals": "smb_file_access" } ] }
+        ]
+      } }
   ]
 }
