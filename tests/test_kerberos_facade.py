@@ -87,6 +87,30 @@ def test_unknown_principal():
     assert int(err["error-code"]) == facade._k.KDC_ERR_C_PRINCIPAL_UNKNOWN
 
 
+def test_tgs_rep_is_kerberoastable():
+    # The TGS-REP's service ticket must decrypt with the SPN account's key (crackable).
+    ctx, _ = make_ctx()
+    ids = Identities(domain="acme.corp", users=[
+        ADUser(sam="svc-sql", password="Summ3r2025!", spn="MSSQLSvc/app01.acme.corp:1433"),
+    ])
+    facade = KerberosFacade.from_config(KerberosConfig(port=88), replace(ctx, identities=ids))
+    facade._k = _load_krb5()
+    k = facade._k
+    from impacket.krb5.crypto import _enctype_table, string_to_key
+
+    reply_key = k.Key(23, b"\x22" * 16)
+    raw = facade._build_tgs_rep("attacker", "MSSQLSvc/app01.acme.corp:1433", "Summ3r2025!", reply_key, 8, 0)
+    from pyasn1.codec.der import decoder
+    from impacket.krb5.asn1 import TGS_REP
+
+    rep, _ = decoder.decode(raw, asn1Spec=TGS_REP())
+    cipher = bytes(rep["ticket"]["enc-part"]["cipher"])
+    spn_key = string_to_key(23, "Summ3r2025!", None)
+    assert _enctype_table[23].decrypt(spn_key, 2, cipher)  # cracks to the SPN password
+    # the reply enc-part must decrypt with the client's reply key
+    assert _enctype_table[23].decrypt(reply_key, 8, bytes(rep["enc-part"]["cipher"]))
+
+
 def test_telemetry_flags_roast_as_alert():
     ctx, sink = make_ctx()
     ctx = replace(ctx, identities=_identities())

@@ -101,6 +101,8 @@ def build_directory(identities, hostname: str, base_dn: str | None) -> tuple[str
         }
         if u.upn:
             attrs["userPrincipalName"] = [u.upn]
+        if u.spn:
+            attrs["servicePrincipalName"] = [u.spn]
         if u.description:
             attrs["description"] = [u.description]
         memberof = [group_dn[g.lower()] for g in u.groups if g.lower() in group_dn]

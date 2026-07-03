@@ -9,10 +9,12 @@ just facades that respond convincingly enough to test against, and log everythin
 Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-teamers.
 
 > **Scope of realism (read this).** rangefinder is *enumeration / version-detection*
-> grade. The `kerberos` facade issues real, crackable AS-REP-roast tickets (GetNPUsers
-> works), but it does **not** validate credentials or complete real domain auth (NTLM /
-> Kerberos single sign-on, Kerberoasting/TGS yet), so tools that pivot on authenticated
-> domain access (BloodHound collection, secretsdump) will not complete **by design**. The **LDAP** facade speaks real
+> grade. The `kerberos` facade issues real, crackable AS-REP-roast and Kerberoast (TGS)
+> tickets over RC4 (the roasting path attackers use), but it does **not** validate
+> credentials or complete real single sign-on. `GetUserSPNs.py` end-to-end additionally
+> needs the NTLM LDAP bind (next phase); the AES AS-exchange has a salt caveat. Tools that
+> pivot on authenticated domain access (BloodHound collection, secretsdump) will not
+> complete **by design**. The **LDAP** facade speaks real
 > LDAPv3 for enumeration (anonymous bind + search; LDAPS via `tls: true`) but has no
 > SASL/StartTLS or writes. HTTP and LDAP serve over TLS with a self-signed cert (nmap
 > fingerprints it); other TLS ports (RDP, IMAPS, …) remain decoys for now. The
@@ -46,7 +48,7 @@ A range config has four parts:
 | `http` | HTTP/1.1(S) server | server header, canned route table, planted-vuln routes, HEAD, keep-alive. `tls: true` for HTTPS. Routes gate on Basic auth (`auth_realm`/`auth_users`) and every credential attempt is captured as telemetry |
 | `banner` | generic TCP banner | text banner + regex rules (FTP/SMTP/POP3), or `binary: true` with `banner_hex` / hex `match_hex`+`respond_hex` rules for binary protocols (MySQL greeting, RDP X.224) so nmap `-sV` versions them |
 | `ssh` | real SSH server | asyncssh-backed: genuine key exchange, so clients reach auth. Captures every password/public-key attempt as telemetry and rejects it; `accept_creds` lets a planted login succeed into a decoy shell that logs typed commands. `server_version` sets the OpenSSH banner nmap reads |
-| `kerberos` | KDC (AS-REP roasting) | answers AS-REQ on 88 (UDP+TCP); issues a real crackable AS-REP for `identities` accounts flagged `no_preauth`, so impacket's `GetNPUsers.py` harvests a `$krb5asrep$` hash. Logs the roast as an alert. Roasting decoy, not a full KDC (Kerberoasting/TGS to follow) |
+| `kerberos` | KDC (roasting) | answers AS-REQ + TGS-REQ on 88 (UDP+TCP). **AS-REP roasting**: a `no_preauth` account yields a real `$krb5asrep$` hash (GetNPUsers). **Kerberoasting**: an account with an `spn` yields a `$krb5tgs$` service ticket over the AS→TGS flow. Both are crackable RC4; logged as alerts. A roasting decoy, not a full KDC |
 | `ldap` | LDAPv3(S) directory | real BER wire protocol; renders `identities` (users/groups) and the range's Windows hosts (computer objects + Domain Controllers OU) into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. `tls: true` serves LDAPS. Enumeration-grade (no cred validation / SASL / writes) |
 | `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
 | `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |

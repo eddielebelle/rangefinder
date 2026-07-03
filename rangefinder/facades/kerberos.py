@@ -41,6 +41,7 @@ class KerberosFacade(Facade):
         ids = ctx.identities
         self.realm = (cfg.realm or (ids.domain if ids else "example.local")).upper()
         self.users = {u.sam.lower(): u for u in (ids.users if ids else [])}
+        self.spns = {u.spn.lower(): u for u in (ids.users if ids else []) if u.spn}
         self._udp = None
         self._tcp = None
         self._stopped: asyncio.Future | None = None
@@ -108,11 +109,12 @@ class KerberosFacade(Facade):
             return None
         # Application tag: [APPLICATION 10] AS-REQ = 0x6a, [APPLICATION 12] TGS-REQ = 0x6c.
         try:
-            if data[0] == 0x6A:
+            if data[0] == 0x6A:  # AS-REQ
                 req, _ = self._k.decoder.decode(data, asn1Spec=self._k.AS_REQ())
                 return self._handle_as_req(req, src_ip, src_port)
-            # TGS-REQ (Kerberoasting) not implemented yet.
-            self._emit_error(src_ip, src_port, None, "tgs_not_implemented")
+            if data[0] == 0x6C:  # TGS-REQ (Kerberoasting)
+                req, _ = self._k.decoder.decode(data, asn1Spec=self._k.TGS_REQ())
+                return self._handle_tgs_req(req, src_ip, src_port)
             return self._build_error(self._k.KDC_ERR_SVC_UNAVAILABLE, self.realm, "krbtgt")
         except Exception:
             return None
@@ -153,6 +155,124 @@ class KerberosFacade(Facade):
                                 "asrep_roastable": roastable}},
         ))
         return self._build_as_rep(user, realm, acct.password, nonce, etype)
+
+    def _handle_tgs_req(self, req, src_ip, src_port) -> bytes | None:
+        k = self._k
+        body = req["req-body"]
+        spn = "/".join(str(x) for x in body["sname"]["name-string"])
+        nonce = int(body["nonce"]) if body["nonce"].hasValue() else 0
+
+        ap_req = None
+        for p in req["padata"]:
+            if int(p["padata-type"]) == k.PA_TGS_REQ:
+                ap_req, _ = k.decoder.decode(bytes(p["padata-value"]), asn1Spec=k.AP_REQ())
+                break
+        if ap_req is None:
+            return self._build_error(k.KDC_ERR_SVC_UNAVAILABLE, self.realm, spn)
+
+        # Decrypt the presented TGT (we issued it, so we hold the krbtgt key) to recover the
+        # session key S1 and the client identity.
+        tgt = ap_req["ticket"]
+        krbtgt_key = k.string_to_key(_RC4, self.cfg.krbtgt_password, None)
+        tgt_etype = int(tgt["enc-part"]["etype"])
+        tgt_plain = k.enctypes[tgt_etype].decrypt(krbtgt_key, 2, bytes(tgt["enc-part"]["cipher"]))
+        tgt_dec, _ = k.decoder.decode(tgt_plain, asn1Spec=k.EncTicketPart())
+        s1_etype = int(tgt_dec["key"]["keytype"])
+        s1 = bytes(tgt_dec["key"]["keyvalue"])
+        client = str(tgt_dec["cname"]["name-string"][0])
+
+        # The TGS-REP enc-part is keyed by the authenticator subkey if the client sent one
+        # (usage 9), otherwise by the TGT session key (usage 8).
+        reply_key, reply_usage = k.Key(s1_etype, s1), 8
+        try:
+            auth_etype = int(ap_req["authenticator"]["etype"])
+            auth_plain = k.enctypes[auth_etype].decrypt(k.Key(s1_etype, s1), 7, bytes(ap_req["authenticator"]["cipher"]))
+            auth, _ = k.decoder.decode(auth_plain, asn1Spec=k.Authenticator())
+            if auth["subkey"].hasValue():
+                reply_key = k.Key(int(auth["subkey"]["keytype"]), bytes(auth["subkey"]["keyvalue"]))
+                reply_usage = 9
+        except Exception:
+            pass
+
+        self.ctx.emitter.emit(ev.krb_event(
+            self, "kerberos_tgs_req", category=["authentication"], etype=["start"],
+            src_ip=src_ip, src_port=src_port,
+            extra={"kerberos": {"client": client, "spn": spn}},
+        ))
+
+        acct = self.spns.get(spn.lower())
+        if acct is None or acct.password is None:
+            self._emit_error(src_ip, src_port, spn, "spn_unknown")
+            return self._build_error(k.KDC_ERR_S_PRINCIPAL_UNKNOWN, self.realm, spn)
+
+        self.ctx.emitter.emit(ev.krb_event(
+            self, "kerberos_tgs_rep", category=["authentication"], etype=["start"],
+            kind="alert", outcome="success", src_ip=src_ip, src_port=src_port,
+            extra={"kerberos": {"client": client, "spn": spn, "spn_account": acct.sam,
+                                "kerberoastable": True}},
+        ))
+        return self._build_tgs_rep(client, spn, acct.password, reply_key, reply_usage, nonce)
+
+    def _build_tgs_rep(self, client, spn, spn_password, reply_key, reply_usage, nonce) -> bytes:
+        import os
+
+        k = self._k
+        now = datetime.datetime.now(datetime.timezone.utc)
+        end = now + datetime.timedelta(hours=10)
+        s2 = os.urandom(16)
+        spn_key = k.string_to_key(_RC4, spn_password, None)  # RC4 service ticket = crackable
+
+        # Service ticket -> encrypted with the SPN account key (the roastable material).
+        svc = k.EncTicketPart()
+        svc["flags"] = k.encodeFlags([])
+        svc["key"] = k.noValue
+        svc["key"]["keytype"] = _RC4
+        svc["key"]["keyvalue"] = s2
+        svc["crealm"] = self.realm
+        k.seq_set(svc, "cname", k.Principal(client, type=k.NT_PRINCIPAL).components_to_asn1)
+        svc["transited"] = k.noValue
+        svc["transited"]["tr-type"] = 0
+        svc["transited"]["contents"] = b""
+        svc["authtime"] = k.KerberosTime.to_asn1(now)
+        svc["endtime"] = k.KerberosTime.to_asn1(end)
+        svc_enc = k.enctypes[_RC4].encrypt(spn_key, 2, k.encoder.encode(svc), None)
+
+        # TGS-REP enc-part -> encrypted with the client's reply key.
+        enc = k.EncTGSRepPart()
+        enc["key"] = k.noValue
+        enc["key"]["keytype"] = _RC4
+        enc["key"]["keyvalue"] = s2
+        enc["last-req"] = k.noValue
+        enc["last-req"][0] = k.noValue
+        enc["last-req"][0]["lr-type"] = 0
+        enc["last-req"][0]["lr-value"] = k.KerberosTime.to_asn1(now)
+        enc["nonce"] = nonce
+        enc["flags"] = k.encodeFlags([])
+        enc["authtime"] = k.KerberosTime.to_asn1(now)
+        enc["endtime"] = k.KerberosTime.to_asn1(end)
+        enc["srealm"] = self.realm
+        k.seq_set(enc, "sname", k.Principal(spn, type=k.NT_SRV_INST).components_to_asn1)
+        enc_cipher = k.enctypes[reply_key.enctype].encrypt(reply_key, reply_usage, k.encoder.encode(enc), None)
+
+        rep = k.TGS_REP()
+        rep["pvno"] = 5
+        rep["msg-type"] = k.TGS_REP_TAG
+        rep["crealm"] = self.realm
+        k.seq_set(rep, "cname", k.Principal(client, type=k.NT_PRINCIPAL).components_to_asn1)
+        rep["ticket"] = k.noValue
+        t = rep["ticket"]
+        t["tkt-vno"] = 5
+        t["realm"] = self.realm
+        k.seq_set(t, "sname", k.Principal(spn, type=k.NT_SRV_INST).components_to_asn1)
+        t["enc-part"] = k.noValue
+        t["enc-part"]["etype"] = _RC4
+        t["enc-part"]["kvno"] = 2
+        t["enc-part"]["cipher"] = svc_enc
+        rep["enc-part"] = k.noValue
+        rep["enc-part"]["etype"] = reply_key.enctype
+        rep["enc-part"]["kvno"] = 2
+        rep["enc-part"]["cipher"] = enc_cipher
+        return k.encoder.encode(rep)
 
     def _emit_error(self, src_ip, src_port, user, reason) -> None:
         self.ctx.emitter.emit(ev.krb_event(
@@ -267,23 +387,28 @@ def _load_krb5() -> SimpleNamespace:
 
     from impacket.krb5 import constants
     from impacket.krb5.asn1 import (
-        AS_REP, AS_REQ, EncASRepPart, EncTicketPart, KRB_ERROR, seq_set,
+        AP_REQ, AS_REP, AS_REQ, Authenticator, EncASRepPart, EncTGSRepPart,
+        EncTicketPart, KRB_ERROR, TGS_REP, TGS_REQ, seq_set,
     )
-    from impacket.krb5.crypto import _enctype_table, string_to_key
+    from impacket.krb5.crypto import Key, _enctype_table, string_to_key
     from impacket.krb5.types import KerberosTime, Principal
 
     return SimpleNamespace(
         decoder=decoder, encoder=encoder, noValue=noValue,
-        AS_REQ=AS_REQ, AS_REP=AS_REP, EncASRepPart=EncASRepPart, EncTicketPart=EncTicketPart,
-        KRB_ERROR=KRB_ERROR, seq_set=seq_set,
-        string_to_key=string_to_key, enctypes=_enctype_table,
+        AS_REQ=AS_REQ, AS_REP=AS_REP, TGS_REQ=TGS_REQ, TGS_REP=TGS_REP, AP_REQ=AP_REQ,
+        Authenticator=Authenticator, EncASRepPart=EncASRepPart, EncTGSRepPart=EncTGSRepPart,
+        EncTicketPart=EncTicketPart, KRB_ERROR=KRB_ERROR, seq_set=seq_set,
+        string_to_key=string_to_key, enctypes=_enctype_table, Key=Key,
         Principal=Principal, KerberosTime=KerberosTime,
         NT_PRINCIPAL=constants.PrincipalNameType.NT_PRINCIPAL.value,
         NT_SRV_INST=constants.PrincipalNameType.NT_SRV_INST.value,
         AS_REP_TAG=int(constants.ApplicationTagNumbers.AS_REP.value),
+        TGS_REP_TAG=int(constants.ApplicationTagNumbers.TGS_REP.value),
         KRB_ERROR_TAG=int(constants.ApplicationTagNumbers.KRB_ERROR.value),
+        PA_TGS_REQ=int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value),
         encodeFlags=constants.encodeFlags,
         KDC_ERR_C_PRINCIPAL_UNKNOWN=int(constants.ErrorCodes.KDC_ERR_C_PRINCIPAL_UNKNOWN.value),
+        KDC_ERR_S_PRINCIPAL_UNKNOWN=int(constants.ErrorCodes.KDC_ERR_S_PRINCIPAL_UNKNOWN.value),
         KDC_ERR_PREAUTH_REQUIRED=int(constants.ErrorCodes.KDC_ERR_PREAUTH_REQUIRED.value),
         KDC_ERR_SVC_UNAVAILABLE=int(constants.ErrorCodes.KDC_ERR_SVC_UNAVAILABLE.value),
     )
