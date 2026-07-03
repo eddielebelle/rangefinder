@@ -1,0 +1,78 @@
+"""Fidelity-harness tests.
+
+HTTP uses a genuinely independent oracle (stdlib http.server) so a match cannot be an
+artifact of diffing our facade against itself. LDAP has no stdlib server to stand up, so it
+serves a known ldap facade as the target and verifies the capture->replay round-trip is
+lossless (the cross-software LDAP oracle is the manual OpenLDAP/Samba demo).
+"""
+
+import functools
+import http.server
+import threading
+
+from rangefinder.verify import _ServedFacade, verify_http, verify_ldap
+
+
+def _serve_dir(directory):
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, httpd.server_address[1]
+
+
+def test_verify_http_faithful(tmp_path):
+    root = tmp_path / "web"
+    (root / ".git").mkdir(parents=True)
+    (root / "index.html").write_text("<html><body>Acme home</body></html>")
+    (root / "robots.txt").write_text("User-agent: *\nDisallow: /admin\n")
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / "backup.sql").write_text("INSERT INTO users VALUES('admin','S3cret!');\n")
+
+    httpd, port = _serve_dir(root)
+    try:
+        report = verify_http(f"http://127.0.0.1:{port}", max_paths=60)
+    finally:
+        httpd.shutdown()
+
+    # captured at least the home page, the exposed .git file and the leaked backup
+    assert report.total >= 3, report.warnings
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert report.score == 1.0
+
+
+def test_diff_http_has_teeth():
+    """The diff engine must flag status, body and header divergences, not rubber-stamp."""
+    from rangefinder.capture.http import _KEEP_HEADERS, _Resp
+    from rangefinder.verify import _diff_http
+
+    cmp = _KEEP_HEADERS | {"server"}
+    real = _Resp(200, {"content-type": "text/html", "server": "nginx"}, b"hello")
+
+    assert _diff_http("/", real, real, cmp) == []  # identical -> faithful
+    kinds = lambda a, b: {d.kind for d in _diff_http("/x", a, b, cmp)}
+    assert "status" in kinds(real, _Resp(404, real.headers, real.body))
+    assert "body" in kinds(real, _Resp(200, real.headers, b"different"))
+    assert "headers" in kinds(real, _Resp(200, {"content-type": "text/plain", "server": "nginx"}, real.body))
+    assert "missing" in kinds(real, None)
+
+
+def test_verify_ldap_round_trip():
+    service = {
+        "type": "ldap", "port": 389, "base_dn": "dc=acme,dc=corp",
+        "allow_anonymous_bind": True,
+        "entries": [
+            {"dn": "", "attributes": {"namingContexts": ["dc=acme,dc=corp"],
+                                      "objectClass": ["top"]}},
+            {"dn": "dc=acme,dc=corp", "attributes": {"objectClass": ["domain"], "dc": ["acme"]}},
+            {"dn": "cn=svc-web,dc=acme,dc=corp",
+             "attributes": {"objectClass": ["user"], "cn": ["svc-web"],
+                            "description": ["set password to Autumn2025!"]}},
+        ],
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_ldap("127.0.0.1", srv.port)
+
+    assert report.total >= 2, report.warnings
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert report.score == 1.0
+    assert any("anonymous" in b for b in report.boundary)

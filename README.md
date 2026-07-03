@@ -64,6 +64,7 @@ rangefinder import nmap scan.xml -o cfg.json      # discover topology from an nm
 rangefinder capture http https://host/ -o cfg.json  # record a live web server -> faithful facade
 rangefinder capture ldap 10.0.0.10 -o cfg.json    # record a live directory -> faithful facade
 rangefinder capture smb  10.0.0.20 -o cfg.json    # record live file shares -> faithful facade
+rangefinder verify http http://10.0.0.30/         # measure replica fidelity vs the live target
 rangefinder score examples/acme.json log.jsonl   # score objectives against a telemetry log
 rangefinder run --host web01 --config examples/corp.json   # serve one host (container entrypoint)
 rangefinder up   -o build/                   # docker compose up -d  (thin wrapper)
@@ -168,6 +169,35 @@ the file tree readable at the given access level (null session by default), reco
 verbatim — so a null-session-readable share reproduces with the same tree on the replica.
 (`http`, `ldap`, and `smb` captors ship; text is captured verbatim, binary/oversized files are
 recorded by name with a placeholder.)
+
+### Verifying fidelity
+
+How do you know the replica is a *feasible* recreation? `verify` measures it as black-box
+differential equivalence — the only honest test, since it compares what the **tooling** sees,
+not implementation. It captures the live target, serves the generated facade in-process on a
+loopback port, then probes **both** with the same client and diffs protocol-aware equivalence
+classes:
+
+```bash
+rangefinder verify http http://10.0.0.30/           # per route: status + body + security headers
+rangefinder verify ldap 10.0.0.10 --bind-dn cn=admin,... --password …   # entry DNs + attribute sets
+```
+
+```
+Fidelity: http  http://10.0.0.30/
+  7/7 faithful (100.0%) from the consumer's perspective
+  fidelity boundary:
+    - uncaptured paths diverge: real 404 vs replica 404 for a path that was never probed
+  => FAITHFUL
+```
+
+It reports a **score** (faithful / total), an explicit **divergence list**, and a **fidelity
+boundary** — the map of where to stop trusting the replica. Two honesty rules are built in:
+the real target is always re-fetched live (comparing the facade to its own captured bytes
+would be a tautology), and fidelity is only claimed for the *perspective the capture
+exercised* (e.g. an anonymous bind — never a credentialed or deeper read it never saw).
+Exit code is non-zero on any divergence, so it gates in CI. Validated against genuine
+third-party software (nginx, OpenLDAP), not just against itself.
 
 ## Scoring
 

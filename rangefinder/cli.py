@@ -92,6 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--config", required=True, type=Path)
     p_run.add_argument("--log-file", type=Path, default=None)
 
+    p_verify = sub.add_parser("verify", help="measure replica fidelity against a live target")
+    verify_sub = p_verify.add_subparsers(dest="proto", required=True)
+    p_v_http = verify_sub.add_parser("http", help="capture + diff a live web server")
+    p_v_http.add_argument("url", help="base URL, e.g. http://10.0.0.5/")
+    p_v_http.add_argument("--max", type=int, default=200, help="max paths to probe")
+    p_v_ldap = verify_sub.add_parser("ldap", help="capture + diff a live directory")
+    p_v_ldap.add_argument("host", help="host or ldap[s]://host")
+    p_v_ldap.add_argument("--port", type=int, default=None)
+    p_v_ldap.add_argument("--tls", action="store_true", help="use LDAPS")
+    p_v_ldap.add_argument("--bind-dn", default="", help="bind DN (default: anonymous)")
+    p_v_ldap.add_argument("--password", default="")
+    p_v_ldap.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_v_http.add_argument("--json", action="store_true", help="emit the report as JSON")
+
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
 
@@ -106,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         "import": cmd_import,
         "capture": cmd_capture,
         "score": cmd_score,
+        "verify": cmd_verify,
         "run": cmd_run,
         "up": cmd_up,
         "down": cmd_down,
@@ -329,6 +344,56 @@ def cmd_score(args) -> int:
     print()
     print(f"Summary: {len(met)}/{len(scoreable)} objectives met")
     return EXIT_OK
+
+
+def cmd_verify(args) -> int:
+    import dataclasses
+
+    from rangefinder.verify import verify_http, verify_ldap
+
+    try:
+        if args.proto == "http":
+            report = verify_http(args.url, max_paths=args.max)
+        elif args.proto == "ldap":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.host if "://" in args.host else "ldap://" + args.host)
+            hostname = parsed.hostname or args.host
+            tls = args.tls or parsed.scheme == "ldaps"
+            port = args.port or parsed.port or (636 if tls else 389)
+            report = verify_ldap(hostname, port, tls=tls, bind_dn=args.bind_dn,
+                                 password=args.password)
+        else:
+            print(f"error: unknown proto {args.proto!r}", file=sys.stderr)
+            return EXIT_ERROR
+    except (ValueError, OSError, RuntimeError, EOFError) as exc:
+        print(f"error: verify failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as exc:  # network I/O against arbitrary targets: never dump a traceback
+        print(f"error: verify failed ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.json:
+        print(json.dumps(dataclasses.asdict(report) | {"score": report.score}, indent=2))
+        return EXIT_OK if report.matched == report.total else EXIT_ERROR
+
+    pct = report.score * 100
+    print(f"Fidelity: {report.protocol}  {report.target}")
+    print(f"  {report.matched}/{report.total} faithful ({pct:.1f}%) from the consumer's perspective")
+    if report.divergences:
+        print(f"  divergences ({len(report.divergences)}):")
+        for d in report.divergences:
+            print(f"    {d.kind:8} {d.key}  —  {d.detail}")
+    if report.boundary:
+        print("  fidelity boundary:")
+        for b in report.boundary:
+            print(f"    - {b}")
+    for w in report.warnings:
+        print(f"  note: {w}", file=sys.stderr)
+    print()
+    verdict = "FAITHFUL" if report.matched == report.total else "DIVERGENCES FOUND"
+    print(f"  => {verdict}")
+    return EXIT_OK if report.matched == report.total else EXIT_ERROR
 
 
 def cmd_run(args) -> int:
