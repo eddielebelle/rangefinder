@@ -42,6 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         "--no-attacker", action="store_true", help="omit the attacker container"
     )
 
+    p_import = sub.add_parser("import", help="generate a config from real-infra discovery output")
+    import_sub = p_import.add_subparsers(dest="importer", required=True)
+    p_imp_nmap = import_sub.add_parser("nmap", help="from an nmap -oX XML scan")
+    p_imp_nmap.add_argument("scan", type=Path)
+    p_imp_nmap.add_argument("-o", "--out", type=Path, default=None, help="output config (default stdout)")
+    p_imp_nmap.add_argument("--name", default="imported", help="range name")
+    p_imp_nmap.add_argument("--subnet", default=None, help="override the derived subnet CIDR")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -63,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         "validate": cmd_validate,
         "schema": cmd_schema,
         "gen": cmd_gen,
+        "import": cmd_import,
         "score": cmd_score,
         "run": cmd_run,
         "up": cmd_up,
@@ -116,6 +125,39 @@ def cmd_gen(args) -> int:
         f"  docker compose -f {compose_path} --profile attacker run --rm attacker"
     )
     return EXIT_OK
+
+
+def cmd_import(args) -> int:
+    if args.importer == "nmap":
+        from rangefinder.importers import import_nmap
+
+        try:
+            config, summary, warnings = import_nmap(
+                args.scan, name=args.name, subnet=args.subnet
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+        text = json.dumps(config, indent=2) + "\n"
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(f"wrote {args.out}", file=sys.stderr)
+        else:
+            sys.stdout.write(text)
+
+        facades = ", ".join(f"{n}×{t}" for t, n in summary["facades"].items())
+        print(
+            f"imported {summary['hosts']} hosts, {summary['services']} services "
+            f"({facades}) on {summary['subnet']}"
+            + (f"; skipped {summary['skipped_hosts']}" if summary["skipped_hosts"] else ""),
+            file=sys.stderr,
+        )
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        return EXIT_OK
+    print(f"error: unknown importer {args.importer!r}", file=sys.stderr)
+    return EXIT_ERROR
 
 
 def cmd_score(args) -> int:
