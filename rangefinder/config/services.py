@@ -86,6 +86,20 @@ class BannerRule(BaseModel):
     close_after: bool = False
 
 
+class KerberosConfig(ServiceBase):
+    """Minimal KDC facade for AS-REP roasting (Kerberoasting to follow).
+
+    Users come from top-level ``identities`` (their ``password`` derives the account key,
+    ``no_preauth`` makes them AS-REP roastable). ``krbtgt_password`` keys the TGT the
+    attacker never cracks.
+    """
+
+    type: Literal["kerberos"] = "kerberos"
+    port: int = Field(default=88, ge=1, le=65535)
+    realm: str | None = None  # default: identities.domain uppercased
+    krbtgt_password: str = "Krbtgt-Rand0m-Passw0rd!"
+
+
 class SshConfig(ServiceBase):
     """Real SSH server (asyncssh): performs KEX, captures + rejects auth attempts."""
 
@@ -184,9 +198,9 @@ class DnsConfig(ServiceBase):
 # route each object to the right model by its "type" key, and produces a JSON Schema
 # oneOf that editors use for per-variant autocomplete.
 BuiltinService = Annotated[
-    Union[HttpConfig, BannerConfig, SshConfig, LdapConfig, SmbConfig, DnsConfig],
+    Union[HttpConfig, BannerConfig, SshConfig, KerberosConfig, LdapConfig, SmbConfig, DnsConfig],
     Field(discriminator="type"),
 ]
 
 # Service types that have a working runtime facade in this release.
-IMPLEMENTED_TYPES = frozenset({"http", "banner", "ssh", "ldap", "smb", "dns"})
+IMPLEMENTED_TYPES = frozenset({"http", "banner", "ssh", "kerberos", "ldap", "smb", "dns"})

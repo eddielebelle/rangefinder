@@ -23,7 +23,8 @@
         "description": "SQL Server service account - pwd Summ3r2025! (rotate quarterly)" },
       { "sam": "svc-backup", "display_name": "Backup Service", "upn": "svc-backup@acme.corp", "groups": ["Backup Operators"],
         "description": "Veeam service account. Do not disable." },
-      { "sam": "svc-web", "display_name": "Web Service", "upn": "svc-web@acme.corp", "groups": ["Domain Users"] }
+      { "sam": "svc-web", "display_name": "Web Service", "upn": "svc-web@acme.corp", "groups": ["Domain Users"],
+        "password": "Autumn2025!", "no_preauth": true }
     ]
   },
   "hosts": [
@@ -40,7 +41,7 @@
             { "name": "acme.corp", "type": "MX", "value": "10 mail01.acme.corp" },
             { "name": "acme.corp", "type": "TXT", "value": "v=spf1 mx include:_spf.acme.corp -all" }
           ] },
-        { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
+        { "type": "kerberos", "port": 88 },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
         { "type": "ldap", "port": 636, "tls": true, "allow_anonymous_bind": true },
         { "type": "smb", "port": 445, "server_os": "Windows Server 2022 Standard 20348",
@@ -63,7 +64,7 @@
       "tags": ["domain-controller"],
       "services": [
         { "type": "banner", "port": 53, "protocol": "domain", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
+        { "type": "kerberos", "port": 88 },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,

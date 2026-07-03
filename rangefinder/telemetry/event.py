@@ -377,6 +377,34 @@ def ssh_command(facade: Any, *, src_ip, src_port, conn_id, username: str, comman
     return _prune(ev)
 
 
+def krb_event(
+    facade: Any,
+    action: str,
+    *,
+    category: list[str],
+    etype: list[str],
+    kind: str = "event",
+    outcome: str = "unknown",
+    src_ip: str | None = None,
+    src_port: int | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """Kerberos KDC telemetry (AS-REQ / AS-REP / errors)."""
+    ev = _envelope(
+        facade,
+        action=action,
+        category=category,
+        etype=etype,
+        kind=kind,
+        outcome=outcome,
+        src_ip=src_ip,
+        src_port=src_port,
+    )
+    if extra:
+        ev["rangefinder"].update(extra)
+    return _prune(ev)
+
+
 def smb_event(
     facade: Any,
     action: str,

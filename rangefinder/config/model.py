@@ -22,7 +22,8 @@ from rangefinder.config.services import BuiltinService
 # newer than the runtime supports, turning "stale image" into a clear, actionable error
 # instead of a cryptic field-rejection deep inside a container.
 # v2: added Objective.sequence (kill-chain scoring).
-SCHEMA_VERSION = 2
+# v3: added kerberos facade + ADUser password/no_preauth/spn (AS-REP roasting).
+SCHEMA_VERSION = 3
 
 
 class OS(str, Enum):
@@ -65,6 +66,11 @@ class ADUser(BaseModel):
     groups: list[str] = Field(default_factory=list)
     description: str | None = None  # a classic place to plant a leaked secret
     enabled: bool = True
+    # Kerberos: a cleartext password derives the account's key. no_preauth sets
+    # DONT_REQUIRE_PREAUTH (AS-REP roastable); spn marks a Kerberoastable service account.
+    password: str | None = None
+    no_preauth: bool = False
+    spn: str | None = None
 
 
 class ADGroup(BaseModel):
