@@ -263,6 +263,35 @@ def ldap_search(
     return _prune(ev)
 
 
+def http_auth(
+    scope: Any,
+    *,
+    scheme: str,
+    username: str,
+    password: str,
+    path: str,
+    outcome: str,
+) -> dict:
+    """Captured HTTP auth attempt (attacker-supplied credentials)."""
+    ev = _envelope(
+        scope.facade,
+        action="http_auth",
+        category=["authentication"],
+        etype=["start"],
+        outcome=outcome,
+        src_ip=scope.src_ip,
+        src_port=scope.src_port,
+        conn_id=scope.conn_id,
+    )
+    ev["url"] = {"path": path}
+    ev["rangefinder"]["auth"] = {
+        "scheme": scheme,
+        "user": username,
+        "password": password,
+    }
+    return _prune(ev)
+
+
 def dns_query(
     facade: Any,
     *,

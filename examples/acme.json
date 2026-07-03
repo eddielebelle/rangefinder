@@ -97,7 +97,8 @@
             "/": { "body": "<html><head><title>ACME Intranet</title></head><body><h1>ACME Intranet</h1><p>Please <a href=\"/login\">sign in</a>.</p></body></html>" },
             "/login": { "body": "<html><body><h1>Sign in</h1><form method=post><input name=user><input name=pass type=password></form></body></html>" },
             "/robots.txt": { "content_type": "text/plain; charset=utf-8", "body": "User-agent: *\nDisallow: /admin\nDisallow: /backup\nDisallow: /api\n" },
-            "/admin": { "status": 401, "headers": { "WWW-Authenticate": "Basic realm=\"ACME Admin\"" }, "body": "<h1>401 Unauthorized</h1>" },
+            "/admin": { "auth_realm": "ACME Admin", "auth_users": { "admin": "admin" },
+              "body": "<html><body><h1>ACME Admin Panel</h1><p>Server management console.</p></body></html>" },
             "/backup/db.config": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-db-config",
               "body": "<connectionStrings>\n  <add name=\"acme\" connectionString=\"Server=app01;Database=acme;User Id=svc-sql;Password=Summ3r2025!;\" />\n</connectionStrings>\n" },
             "/.git/HEAD": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-git-dir", "body": "ref: refs/heads/main\n" }

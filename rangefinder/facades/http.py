@@ -9,7 +9,9 @@ request/response decoys, not exploitable code paths.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import base64
+import binascii
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -45,6 +47,8 @@ class _Route:
     content_type: str
     headers: dict[str, str]
     vuln_id: str | None
+    auth_realm: str | None = None
+    auth_users: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -94,6 +98,18 @@ class HttpFacade(Facade):
             status, body, content_type, headers, vuln_id, matched = self._resolve(
                 req, route
             )
+            creds = _basic_creds(req)
+            if creds is not None:
+                scope.emit(
+                    ev.http_auth(
+                        scope,
+                        scheme="basic",
+                        username=creds[0],
+                        password=creds[1],
+                        path=req.path,
+                        outcome="success" if status != 401 else "failure",
+                    )
+                )
             close = not self.cfg.keepalive or req.wants_close
             resp_bytes = await self._send(
                 writer, req, status, body, content_type, headers, close
@@ -215,6 +231,12 @@ class HttpFacade(Facade):
         if req.method not in route.methods and req.method != "HEAD":
             headers = {"Allow": ", ".join(sorted(route.methods))}
             return (405, b"", "text/plain; charset=utf-8", headers, None, req.path)
+        if route.auth_realm is not None:
+            creds = _basic_creds(req)
+            authorized = creds is not None and route.auth_users.get(creds[0]) == creds[1]
+            if not authorized:
+                headers = {"WWW-Authenticate": f'Basic realm="{route.auth_realm}"'}
+                return (401, b"", "text/plain; charset=utf-8", headers, None, req.path)
         return (
             route.status,
             route.body,
@@ -259,6 +281,18 @@ class HttpFacade(Facade):
         return len(raw)
 
 
+def _basic_creds(req: _Request) -> tuple[str, str] | None:
+    auth = req.headers.get("authorization", "")
+    if not auth.lower().startswith("basic "):
+        return None
+    try:
+        raw = base64.b64decode(auth[6:].strip()).decode("latin-1")
+    except (binascii.Error, ValueError):
+        return None
+    user, sep, pw = raw.partition(":")
+    return (user, pw) if sep else None
+
+
 def _build_route(spec: HttpPath, config_dir: str) -> _Route:
     if spec.body_file is not None:
         body = (Path(config_dir) / spec.body_file).read_bytes()
@@ -273,4 +307,6 @@ def _build_route(spec: HttpPath, config_dir: str) -> _Route:
         content_type=spec.content_type,
         headers=dict(spec.headers),
         vuln_id=spec.vuln_id,
+        auth_realm=spec.auth_realm,
+        auth_users=dict(spec.auth_users),
     )

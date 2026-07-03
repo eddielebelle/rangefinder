@@ -45,6 +45,11 @@ class HttpPath(BaseModel):
     # Tagging a route with vuln_id turns its hits into ECS "alert" telemetry events —
     # the hook a SIEM detection rule fires on.
     vuln_id: str | None = None
+    # HTTP Basic auth gating. When auth_realm is set the route returns 401 until valid
+    # credentials arrive; auth_users maps accepted username -> password (empty = reject
+    # all, but still capture every attempt as telemetry).
+    auth_realm: str | None = None
+    auth_users: dict[str, str] = Field(default_factory=dict)
 
 
 class HttpConfig(ServiceBase):

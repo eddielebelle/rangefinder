@@ -56,6 +56,52 @@ def test_vuln_route_emits_alert():
     assert alerts and alerts[0]["rangefinder"]["vuln_id"] == "exposed-git"
 
 
+def _b64(user, pw):
+    import base64
+
+    return base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+
+def test_basic_auth_challenge_and_capture():
+    facade, sink = _facade(
+        paths={"/admin": HttpPath(auth_realm="ACME", auth_users={"admin": "s3cret"}, body="PANEL")}
+    )
+    # No credentials -> 401 challenge
+    data = asyncio.run(serve_and_exchange(facade, _req("/admin")))
+    assert data.startswith(b"HTTP/1.1 401")
+    assert b'WWW-Authenticate: Basic realm="ACME"' in data
+
+
+def test_basic_auth_wrong_creds_captured_as_failure():
+    facade, sink = _facade(
+        paths={"/admin": HttpPath(auth_realm="ACME", auth_users={"admin": "s3cret"}, body="PANEL")}
+    )
+    payload = (
+        f"GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {_b64('root', 'toor')}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    data = asyncio.run(serve_and_exchange(facade, payload))
+    assert data.startswith(b"HTTP/1.1 401")
+    auth = next(e for e in sink.events if e["event"]["action"] == "http_auth")
+    assert auth["rangefinder"]["auth"] == {"scheme": "basic", "user": "root", "password": "toor"}
+    assert auth["event"]["outcome"] == "failure"
+
+
+def test_basic_auth_valid_creds_served_and_captured():
+    facade, sink = _facade(
+        paths={"/admin": HttpPath(auth_realm="ACME", auth_users={"admin": "s3cret"}, body="PANEL")}
+    )
+    payload = (
+        f"GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {_b64('admin', 's3cret')}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    data = asyncio.run(serve_and_exchange(facade, payload))
+    assert data.startswith(b"HTTP/1.1 200 OK")
+    assert data.endswith(b"PANEL")
+    auth = next(e for e in sink.events if e["event"]["action"] == "http_auth")
+    assert auth["event"]["outcome"] == "success"
+
+
 def test_telemetry_records_user_agent_and_status():
     facade, sink = _facade(paths={"/": HttpPath(body="x")})
     payload = b"GET /?q=1 HTTP/1.1\r\nHost: x\r\nUser-Agent: gobuster/3.6\r\nConnection: close\r\n\r\n"
