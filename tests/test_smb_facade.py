@@ -88,13 +88,19 @@ def test_pass_the_hash_validation():
     def client(port, nthash):
         from impacket.smbconnection import SMBConnection
 
+        c = None
         try:
             c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
             c.login("svc-web", "", "acme.corp", nthash=nthash)
-            c.close()
             return True
         except Exception:
             return False
+        finally:
+            if c is not None:
+                try:
+                    c.close()  # close even on failure so the server logs the disconnect
+                except Exception:
+                    pass
 
     async def run():
         ctx, sink = make_ctx()

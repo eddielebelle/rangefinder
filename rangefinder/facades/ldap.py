@@ -6,9 +6,11 @@ LDAPv3 over the wire (BER via pyasn1 + the rfc2251 schema), supports the RootDSE
 and the filter operators enumeration tools actually send (and/or/not/equality/present/
 substrings), and logs every bind and search.
 
-Deliberate limits: no password validation (any simple bind succeeds — attempted
-credentials are captured as telemetry), no writes, no SASL/StartTLS, no paged-results
-control. It renders a directory for enumeration; it is not a domain controller.
+It also validates NTLM binds: SASL GSS-SPNEGO (what GetUserSPNs / BloodHound use) and the
+legacy MS Sicily mechanism both run the NTLM challenge/response against the ``identities``
+NT hashes. Deliberate limits: simple binds are unvalidated (anonymous succeeds; attempted
+credentials are captured), no NTLM signing/sealing on the post-bind session, no writes,
+no StartTLS, no paged-results control. It renders a directory for enumeration.
 """
 
 from __future__ import annotations
@@ -343,6 +345,17 @@ class LdapFacade(Facade):
         else:
             self.root_dse = _root_dse(self.base_dn, ctx.host_name, domain)
 
+        # For NTLM (Sicily) bind validation.
+        self._passwords = {
+            u.sam.lower(): u.password
+            for u in (identities.users if identities else [])
+            if u.password
+        }
+        self._netbios = (
+            (identities.netbios or identities.domain.split(".")[0].upper())
+            if identities else "WORKGROUP"
+        )
+
     @classmethod
     def from_config(cls, cfg: LdapConfig, ctx: FacadeContext) -> "LdapFacade":
         self = cls(cfg=cfg, ctx=ctx, service_id=f"{'ldaps' if cfg.tls else 'ldap'}-{cfg.port}")
@@ -354,6 +367,7 @@ class LdapFacade(Facade):
         return self
 
     async def handle(self, scope, reader, writer):
+        ntlm_state: dict = {}  # per-connection NTLM (Sicily) bind state
         while True:
             substrate = await _read_message(reader)
             if substrate is None:
@@ -361,13 +375,21 @@ class LdapFacade(Facade):
             try:
                 msg, _ = decoder.decode(substrate, asn1Spec=L.LDAPMessage())
             except PyAsn1Error:
-                return  # malformed; drop the connection
+                # rfc2251 can't decode an MS Sicily (NTLM) bind; handle it out of band.
+                if await self._handle_sicily(scope, writer, substrate, ntlm_state):
+                    continue
+                return  # genuinely malformed
             mid = int(msg["messageID"])
             op = msg["protocolOp"]
             kind = op.getName()
 
             if kind == "bindRequest":
-                await self._handle_bind(scope, writer, mid, op["bindRequest"])
+                req = op["bindRequest"]
+                auth = req["authentication"]
+                if auth.getName() == "sasl" and str(auth["sasl"]["mechanism"]) == "GSS-SPNEGO":
+                    await self._handle_spnego(scope, writer, mid, bytes(auth["sasl"]["credentials"]), ntlm_state)
+                else:
+                    await self._handle_bind(scope, writer, mid, req)
             elif kind == "searchRequest":
                 await self._handle_search(scope, writer, mid, op["searchRequest"])
             elif kind == "unbindRequest":
@@ -381,6 +403,94 @@ class LdapFacade(Facade):
                 writer.write(_encode(mid, "extendedResp", er))
                 await writer.drain()
             # abandonRequest and unhandled ops: silently ignore (no response expected)
+
+    async def _handle_spnego(self, scope, writer, mid: int, creds: bytes, state: dict) -> None:
+        """NTLM over LDAP via SASL GSS-SPNEGO (what GetUserSPNs / BloodHound use)."""
+        import struct
+
+        from impacket.spnego import SPNEGO_NegTokenResp, TypesMech
+
+        from rangefinder.ntlm import build_challenge, nt_hash, validate
+
+        token = _extract_ntlm_token(creds)
+        if token is None or len(token) < 12:
+            writer.write(_bind_response(mid, 49))
+            await writer.drain()
+            return
+        msg_type = struct.unpack("<I", token[8:12])[0]
+
+        if msg_type == 1:  # NTLM Type1 -> challenge, returned in serverSaslCreds
+            type2, challenge8, neg, chal = build_challenge(token, self.ctx.host_name.upper(), self._netbios)
+            state.update(challenge8=challenge8, neg=neg, chal=chal)
+            resp = SPNEGO_NegTokenResp()
+            resp["NegState"] = b"\x01"  # accept-incomplete
+            resp["SupportedMech"] = TypesMech["NTLMSSP - Microsoft NTLM Security Support Provider"]
+            resp["ResponseToken"] = type2
+            writer.write(_bind_response(mid, 14, server_sasl_creds=resp.getData()))  # saslBindInProgress
+            await writer.drain()
+            return
+
+        if msg_type == 3:  # NTLM Type3 -> validate
+            neg, chal, challenge8 = state.get("neg"), state.get("chal"), state.get("challenge8")
+            if neg is None:
+                writer.write(_bind_response(mid, 49))
+                await writer.drain()
+                return
+            domain, user, _ws, _ = validate(token, None, challenge8, neg, chal)
+            pw = self._passwords.get(user.lower())
+            _, _, _, ok = validate(token, nt_hash(pw) if pw else None, challenge8, neg, chal)
+            writer.write(_bind_response(mid, 0 if ok else 49))
+            await writer.drain()
+            scope.emit(ev.ldap_bind(
+                scope, bind_dn=f"{domain}\\{user}" if domain else user,
+                method="ntlm", result_code="success" if ok else "invalidCredentials", password=None,
+            ))
+            return
+        writer.write(_bind_response(mid, 49))
+        await writer.drain()
+
+    async def _handle_sicily(self, scope, writer, substrate: bytes, state: dict) -> bool:
+        """Handle an MS-style NTLM (Sicily) LDAP bind. Returns True if it was one."""
+        parsed = _parse_sicily_bind(substrate)
+        if parsed is None:
+            return False
+        mid, tag, blob = parsed
+
+        if tag == 0x89:  # sicilyPackageDiscovery — advertise NTLM
+            writer.write(_bind_response(mid, 0, b"NTLM"))
+            await writer.drain()
+            return True
+
+        if tag == 0x8A:  # sicilyNegotiate — client's NTLM Type1
+            from rangefinder.ntlm import build_challenge
+
+            type2, challenge8, neg, chal = build_challenge(blob, self.ctx.host_name.upper(), self._netbios)
+            state.update(challenge8=challenge8, neg=neg, chal=chal)
+            # The Type2 challenge is returned in matchedDN with resultCode success.
+            writer.write(_bind_response(mid, 0, type2))
+            await writer.drain()
+            return True
+
+        if tag == 0x8B:  # sicilyResponse — client's NTLM Type3
+            from rangefinder.ntlm import nt_hash, validate
+
+            neg, chal, challenge8 = state.get("neg"), state.get("chal"), state.get("challenge8")
+            if neg is None:
+                writer.write(_bind_response(mid, 49))  # no challenge issued
+                await writer.drain()
+                return True
+            domain, user, workstation, _ = validate(blob, None, challenge8, neg, chal)
+            pw = self._passwords.get(user.lower())
+            _, _, _, ok = validate(blob, nt_hash(pw) if pw else None, challenge8, neg, chal)
+            writer.write(_bind_response(mid, 0 if ok else 49))
+            await writer.drain()
+            scope.emit(ev.ldap_bind(
+                scope, bind_dn=f"{domain}\\{user}" if domain else user,
+                method="ntlm", result_code="success" if ok else "invalidCredentials",
+                password=None,
+            ))
+            return True
+        return False
 
     async def _handle_bind(self, scope: ConnScope, writer, mid: int, req) -> None:
         bind_dn = str(req["name"])
@@ -481,6 +591,76 @@ async def _read_message(reader: asyncio.StreamReader) -> bytes | None:
     except (asyncio.IncompleteReadError, ConnectionError):
         return None
     return tag + length_bytes + body
+
+
+def _read_tlv(data: bytes, off: int):
+    tag = data[off]
+    off += 1
+    length = data[off]
+    off += 1
+    if length & 0x80:
+        n = length & 0x7F
+        length = int.from_bytes(data[off:off + n], "big")
+        off += n
+    return tag, data[off:off + length], off + length
+
+
+def _parse_sicily_bind(substrate: bytes):
+    """Extract (messageID, sicily-auth-tag, ntlm-blob) from a Sicily bind, else None.
+
+    The rfc2251 decoder rejects the Sicily authentication tags ([9]/[10]/[11]), so we walk
+    the BER by hand just far enough to pull out the NTLM token.
+    """
+    try:
+        tag, seq, _ = _read_tlv(substrate, 0)
+        if tag != 0x30:  # LDAPMessage SEQUENCE
+            return None
+        off = 0
+        mtag, mval, off = _read_tlv(seq, off)  # messageID
+        if mtag != 0x02:
+            return None
+        message_id = int.from_bytes(mval, "big")
+        ptag, pval, off = _read_tlv(seq, off)  # protocolOp
+        if ptag != 0x60:  # bindRequest [APPLICATION 0]
+            return None
+        boff = 0
+        _, _, boff = _read_tlv(pval, boff)  # version
+        _, _, boff = _read_tlv(pval, boff)  # name
+        atag, aval, boff = _read_tlv(pval, boff)  # authentication
+        if atag in (0x89, 0x8A, 0x8B):  # sicilyPackageDiscovery / Negotiate / Response
+            return message_id, atag, aval
+        return None
+    except (IndexError, ValueError):
+        return None
+
+
+def _bind_response(message_id: int, result_code: int, matched_dn: bytes = b"",
+                   server_sasl_creds: bytes | None = None) -> bytes:
+    br = L.BindResponse()
+    br["resultCode"] = result_code
+    br["matchedDN"] = matched_dn  # carries the NTLM Type2 for a sicilyNegotiate reply
+    br["errorMessage"] = b""
+    if server_sasl_creds is not None:
+        br["serverSaslCreds"] = server_sasl_creds  # carries the Type2 for GSS-SPNEGO
+    return _encode(message_id, "bindResponse", br)
+
+
+def _extract_ntlm_token(creds: bytes) -> bytes | None:
+    """Pull the raw NTLM message out of a SASL GSS-SPNEGO credential blob."""
+    if not creds:
+        return None
+    from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp
+
+    try:
+        if creds[0] == 0x60:  # NegTokenInit (first message)
+            return bytes(SPNEGO_NegTokenInit(creds)["MechToken"])
+        if creds[0] == 0xA1:  # NegTokenResp (subsequent)
+            return bytes(SPNEGO_NegTokenResp(creds)["ResponseToken"])
+        if creds[:7] == b"NTLMSSP":  # raw NTLM (no SPNEGO wrapper)
+            return creds
+    except Exception:
+        return None
+    return None
 
 
 def _encode(message_id: int, op_name: str, op) -> bytes:

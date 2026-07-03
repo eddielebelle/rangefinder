@@ -69,6 +69,9 @@ class SmbFacade(Facade):
         srv.setSMB2Support(True)
 
         inner = srv.getServer()
+        # Per-connection handler threads must be daemons: otherwise server_close() joins
+        # them at shutdown and a stuck/unclosed client connection would hang stop() forever.
+        inner.daemon_threads = True
         # No public setters for these; they populate the negotiate/session response that
         # nmap smb-os-discovery reads.
         inner._SMBSERVER__serverOS = self.cfg.server_os
