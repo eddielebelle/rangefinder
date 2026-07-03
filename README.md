@@ -18,8 +18,9 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 > LDAPv3 for enumeration (anonymous bind + search; LDAPS via `tls: true`) but has no
 > SASL/StartTLS or writes. HTTP and LDAP serve over TLS with a self-signed cert (nmap
 > fingerprints it); other TLS ports (RDP, IMAPS, …) remain decoys for now. The
-> **SMB** facade (impacket-backed) serves the configured shares as real files and captures
-> NTLM auth attempts without validating them (`readonly` is advisory). The **SSH** facade
+> **SMB** facade (impacket-backed) serves the configured shares as real files and validates
+> NTLM against the `identities` NT hashes (pass-the-hash), while still allowing null-session
+> enumeration (`readonly` is advisory). The **SSH** facade
 > does a real key exchange and captures credential attempts, but its shell is a decoy (no
 > command execution). Planted "vulns" are canned decoys that answer scanners and populate
 > telemetry; they are not exploitable. TCP only (no UDP / `nmap -sU`).
@@ -50,7 +51,7 @@ A range config has four parts:
 | `ssh` | real SSH server | asyncssh-backed: genuine key exchange, so clients reach auth. Captures every password/public-key attempt as telemetry and rejects it; `accept_creds` lets a planted login succeed into a decoy shell that logs typed commands. `server_version` sets the OpenSSH banner nmap reads |
 | `kerberos` | KDC (roasting) | answers AS-REQ + TGS-REQ on 88 (UDP+TCP). **AS-REP roasting**: a `no_preauth` account yields a real `$krb5asrep$` hash (GetNPUsers). **Kerberoasting**: an account with an `spn` yields a `$krb5tgs$` service ticket over the AS→TGS flow. Both are crackable RC4; logged as alerts. A roasting decoy, not a full KDC |
 | `ldap` | LDAPv3(S) directory | real BER wire protocol; renders `identities` (users/groups) and the range's Windows hosts (computer objects + Domain Controllers OU) into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. `tls: true` serves LDAPS. Enumeration-grade (no cred validation / SASL / writes) |
-| `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
+| `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files (`smbclient -L` / `enum4linux` enumerate them). **Validates NTLM** against `identities` NT hashes — pass-the-hash succeeds with the right hash, a wrong hash is rejected (failed logon → alert) — while null-session enumeration still works. `readonly` is advisory |
 | `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |
 
 ## CLI

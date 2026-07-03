@@ -73,3 +73,51 @@ def test_smb_share_enumeration_and_telemetry():
     # the auth event captured the (anonymous) session
     auth = next(e for e in sink.events if e["event"]["action"] == "smb_auth")
     assert auth["rangefinder"]["auth"]["method"] == "anonymous"
+
+
+def test_pass_the_hash_validation():
+    from binascii import hexlify
+    from dataclasses import replace
+
+    from impacket.ntlm import compute_nthash
+
+    from rangefinder.config.model import ADUser, Identities
+
+    good = hexlify(compute_nthash("Autumn2025!")).decode()
+
+    def client(port, nthash):
+        from impacket.smbconnection import SMBConnection
+
+        try:
+            c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+            c.login("svc-web", "", "acme.corp", nthash=nthash)
+            c.close()
+            return True
+        except Exception:
+            return False
+
+    async def run():
+        ctx, sink = make_ctx()
+        ctx = replace(ctx, identities=Identities(
+            domain="acme.corp", users=[ADUser(sam="svc-web", password="Autumn2025!")]))
+        port = _free_port()
+        cfg = SmbConfig(port=port, shares=[SmbShare(name="PUBLIC", files={"a.txt": "x"})])
+        facade = SmbFacade.from_config(cfg, ctx)
+        facade.bind_host = "127.0.0.1"
+        facade.port = port
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(None, client, port, good)
+            bad = await loop.run_in_executor(None, client, port, "00" * 16)
+        finally:
+            await facade.stop()
+        return ok, bad, sink
+
+    ok, bad, sink = asyncio.run(run())
+    assert ok is True    # pass-the-hash with the right NT hash succeeds
+    assert bad is False  # wrong hash is rejected
+    outcomes = {(e["rangefinder"]["auth"]["user"], e["event"]["outcome"])
+                for e in sink.events if e["event"]["action"] == "smb_auth"}
+    assert ("svc-web", "success") in outcomes
+    assert ("svc-web", "failure") in outcomes

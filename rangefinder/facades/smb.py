@@ -78,6 +78,19 @@ class SmbFacade(Facade):
             path = self._materialize(share)
             srv.addShare(share.name, path, share.comment)
 
+        # NTLM validation: register each identities account's NT hash. impacket then
+        # validates authenticated logons (pass-the-hash succeeds with the right hash, wrong
+        # hash fails) while null-session enumeration still works.
+        ids = self.ctx.identities
+        if ids:
+            from binascii import hexlify
+
+            from impacket.ntlm import compute_nthash
+
+            for u in ids.users:
+                if u.password:
+                    srv.addCredential(u.sam, 0, "", hexlify(compute_nthash(u.password)).decode())
+
         self._install_telemetry()
 
         self._srv = srv
@@ -191,18 +204,20 @@ class _SmbTelemetryHandler(logging.Handler):
 
         m = re.search(r"AUTHENTICATE_MESSAGE \((.*?)\\(.*?),(.*?)\)", msg)
         if m:
+            # Record the attempt; the outcome is emitted on the following success line or on
+            # connection close (a failed logon never logs "authenticated successfully").
             domain, user, workstation = m.group(1), m.group(2), m.group(3)
-            anon = not user
-            self._emit(
-                "smb_auth", category=["authentication"], etype=["start"], tid=tid,
-                outcome="success",
-                extra={"auth": {
-                    "domain": domain or None,
-                    "user": user or None,
-                    "workstation": workstation or None,
-                    "method": "anonymous" if anon else "ntlm",
-                }},
-            )
+            conn = self._conns.setdefault(tid, {})
+            conn["pending_auth"] = {
+                "domain": domain or None,
+                "user": user or None,
+                "workstation": workstation or None,
+                "method": "anonymous" if not user else "ntlm",
+            }
+            return
+
+        if "authenticated successfully" in msg:
+            self._flush_auth(tid, "success")
             return
 
         m = re.search(r"NetrShareEnum", msg)
@@ -230,6 +245,22 @@ class _SmbTelemetryHandler(logging.Handler):
 
         m = re.search(r"Closing down connection \(([^,]+),(\d+)\)", msg)
         if m:
+            self._flush_auth(tid, "failure")  # an unconfirmed auth attempt = a failed logon
             self._emit("connection_close", category=["network"], etype=["connection", "end"], tid=tid, outcome="success")
             self._conns.pop(tid, None)
             return
+
+    def _flush_auth(self, tid: int, outcome: str) -> None:
+        conn = self._conns.get(tid)
+        if not conn or "pending_auth" not in conn:
+            return
+        auth = conn.pop("pending_auth")
+        # An anonymous/null bind that never "authenticated successfully" on close is normal
+        # enumeration, not a failed logon — don't cry wolf.
+        if outcome == "failure" and auth["method"] == "anonymous":
+            return
+        self._emit(
+            "smb_auth", category=["authentication"], etype=["start"], tid=tid,
+            kind="alert" if outcome == "failure" else "event",
+            outcome=outcome, extra={"auth": auth},
+        )
