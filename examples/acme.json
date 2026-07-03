@@ -42,6 +42,7 @@
           ] },
         { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
+        { "type": "ldap", "port": 636, "tls": true, "allow_anonymous_bind": true },
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 464, "protocol": "kpasswd5", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3268, "protocol": "ldap", "banner": "", "close_after_banner": true },
@@ -98,7 +99,11 @@
               "body": "<connectionStrings>\n  <add name=\"acme\" connectionString=\"Server=app01;Database=acme;User Id=svc-sql;Password=Summ3r2025!;\" />\n</connectionStrings>\n" },
             "/.git/HEAD": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-git-dir", "body": "ref: refs/heads/main\n" }
           } },
-        { "type": "banner", "port": 443, "protocol": "https", "banner": "", "close_after_banner": true }
+        { "type": "http", "port": 443, "tls": true, "server_header": "nginx/1.18.0 (Ubuntu)",
+          "paths": {
+            "/": { "body": "<html><head><title>ACME Secure Portal</title></head><body><h1>ACME Secure Portal</h1><p>Employees only.</p></body></html>" },
+            "/admin": { "status": 401, "headers": { "WWW-Authenticate": "Basic realm=\"ACME Admin\"" }, "body": "<h1>401 Unauthorized</h1>" }
+          } }
       ]
     },
     {

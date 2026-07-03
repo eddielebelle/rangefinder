@@ -50,6 +50,7 @@ class HttpPath(BaseModel):
 class HttpConfig(ServiceBase):
     type: Literal["http"] = "http"
     port: int = Field(default=80, ge=1, le=65535)
+    tls: bool = False  # serve HTTPS with a self-signed cert
     server_header: str = "Apache/2.4.52 (Ubuntu)"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     paths: dict[str, HttpPath] = Field(default_factory=dict)
@@ -93,6 +94,7 @@ class BannerConfig(ServiceBase):
 class LdapConfig(ServiceBase):
     type: Literal["ldap"] = "ldap"
     port: int = Field(default=389, ge=1, le=65535)
+    tls: bool = False  # serve LDAPS (implicit TLS, typically port 636)
     base_dn: str | None = None  # default derived from identities.domain
     allow_anonymous_bind: bool = True
 

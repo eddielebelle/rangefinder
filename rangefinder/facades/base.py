@@ -77,7 +77,18 @@ class Facade(abc.ABC):
         self.ctx = ctx
         self.service_id = service_id
         self.protocol = protocol
+        # When set, the base listener wraps connections in TLS (HTTPS, LDAPS, ...).
+        self.ssl_context = None
         self._server: asyncio.AbstractServer | None = None
+
+    def tls_sans(self) -> list[str]:
+        """Subject alternative names for this host's self-signed cert."""
+        names = [self.host_name, self.host_name.lower()]
+        if self.ctx.identities is not None:
+            names.append(f"{self.host_name.lower()}.{self.ctx.identities.domain}")
+        if self.host_ip:
+            names.append(self.host_ip)
+        return names
 
     # ---- identity fields read by the telemetry envelope --------------------------
     @property
@@ -119,7 +130,11 @@ class Facade(abc.ABC):
     # ---- lifecycle ---------------------------------------------------------------
     async def start(self) -> None:
         self._server = await asyncio.start_server(
-            self._wrapped_handle, self.bind_host, self.port, reuse_address=True
+            self._wrapped_handle,
+            self.bind_host,
+            self.port,
+            reuse_address=True,
+            ssl=self.ssl_context,
         )
         self.ctx.emitter.emit(ev.service_listen(self))
 

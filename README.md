@@ -12,7 +12,9 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 > grade. It does **not** validate credentials or complete real domain auth (Kerberos/NTLM
 > single sign-on), so tools that pivot on authenticated domain access (BloodHound
 > collection, secretsdump) will not complete **by design**. The **LDAP** facade speaks real
-> LDAPv3 for enumeration (anonymous bind + search) but has no SASL/StartTLS or writes. The
+> LDAPv3 for enumeration (anonymous bind + search; LDAPS via `tls: true`) but has no
+> SASL/StartTLS or writes. HTTP and LDAP serve over TLS with a self-signed cert (nmap
+> fingerprints it); other TLS ports (RDP, IMAPS, …) remain decoys for now. The
 > **SMB** facade (impacket-backed) serves the configured shares as real files and captures
 > NTLM auth attempts without validating them (`readonly` is advisory). Planted "vulns" are
 > canned decoys that answer scanners and populate telemetry; they are not exploitable. TCP
@@ -39,9 +41,9 @@ A range config has four parts:
 
 | type | facade | notes |
 |------|--------|-------|
-| `http` | HTTP/1.1 server | server header, canned route table, planted-vuln routes, HEAD, keep-alive |
+| `http` | HTTP/1.1(S) server | server header, canned route table, planted-vuln routes, HEAD, keep-alive. Set `tls: true` for HTTPS with a self-signed cert |
 | `banner` | generic TCP banner | server-speaks-first banner for nmap `-sV`; optional line-regex rules. `ssh`/`ftp`/`smtp` are just banner presets |
-| `ldap` | LDAPv3 directory | real BER wire protocol; renders `identities` into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. Enumeration-grade (no cred validation / SASL / writes) |
+| `ldap` | LDAPv3(S) directory | real BER wire protocol; renders `identities` into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. `tls: true` serves LDAPS. Enumeration-grade (no cred validation / SASL / writes) |
 | `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
 | `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |
 

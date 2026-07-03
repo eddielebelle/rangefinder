@@ -272,7 +272,13 @@ class LdapFacade(Facade):
 
     @classmethod
     def from_config(cls, cfg: LdapConfig, ctx: FacadeContext) -> "LdapFacade":
-        return cls(cfg=cfg, ctx=ctx, service_id=f"ldap-{cfg.port}")
+        self = cls(cfg=cfg, ctx=ctx, service_id=f"{'ldaps' if cfg.tls else 'ldap'}-{cfg.port}")
+        if cfg.tls:
+            from rangefinder.tls import server_context
+
+            self.protocol = "ldaps"
+            self.ssl_context = server_context(ctx.host_name, self.tls_sans())
+        return self
 
     async def handle(self, scope, reader, writer):
         while True:

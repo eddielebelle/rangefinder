@@ -74,7 +74,13 @@ class HttpFacade(Facade):
 
     @classmethod
     def from_config(cls, cfg: HttpConfig, ctx: FacadeContext) -> "HttpFacade":
-        self = cls(cfg=cfg, ctx=ctx, service_id=f"http-{cfg.port}")
+        prefix = "https" if cfg.tls else "http"
+        self = cls(cfg=cfg, ctx=ctx, service_id=f"{prefix}-{cfg.port}")
+        if cfg.tls:
+            from rangefinder.tls import server_context
+
+            self.protocol = "https"
+            self.ssl_context = server_context(ctx.host_name, self.tls_sans())
         for path, spec in cfg.paths.items():
             self.routes[path] = _build_route(spec, ctx.config_dir)
         return self
