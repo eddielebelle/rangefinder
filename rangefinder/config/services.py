@@ -123,12 +123,27 @@ class BannerConfig(ServiceBase):
 # --------------------------------------------------- v2 forward models (no facade yet)
 
 
+class LdapEntry(BaseModel):
+    """A raw directory entry (a captured DN + its attributes) replayed verbatim.
+
+    dn="" is the RootDSE. This is how `rangefinder capture ldap` records a real directory:
+    exactly the entries an anonymous (or credentialed) search returned.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dn: str
+    attributes: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class LdapConfig(ServiceBase):
     type: Literal["ldap"] = "ldap"
     port: int = Field(default=389, ge=1, le=65535)
     tls: bool = False  # serve LDAPS (implicit TLS, typically port 636)
-    base_dn: str | None = None  # default derived from identities.domain
+    base_dn: str | None = None  # default derived from identities.domain / entries
     allow_anonymous_bind: bool = True
+    # Raw captured entries served verbatim (in addition to any rendered from identities).
+    entries: list[LdapEntry] = Field(default_factory=list)
 
 
 class SmbShare(BaseModel):

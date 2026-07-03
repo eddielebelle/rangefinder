@@ -49,6 +49,15 @@ def _base_dn(domain: str) -> str:
     return ",".join(f"DC={part}" for part in domain.split("."))
 
 
+def _infer_base_dn(entries) -> str | None:
+    """Pick the domain root from captured entries: the shortest all-DC= DN."""
+    dc_dns = [
+        e.dn for e in entries
+        if e.dn and all(rdn.strip().lower().startswith("dc=") for rdn in e.dn.split(","))
+    ]
+    return min(dc_dns, key=lambda d: d.count(",")) if dc_dns else None
+
+
 def build_directory(identities, hostname: str, base_dn: str | None) -> tuple[str, list[Entry]]:
     """Render identities into a flat list of directory entries + the base DN."""
     if identities is None:
@@ -310,10 +319,27 @@ class LdapFacade(Facade):
         self.cfg = cfg
         identities = ctx.identities
         domain = identities.domain if identities else ""
-        self.base_dn, entries = build_directory(identities, ctx.host_name, cfg.base_dn)
-        entries += build_computers(ctx.hosts, self.base_dn, domain)
+
+        if identities is not None:
+            self.base_dn, entries = build_directory(identities, ctx.host_name, cfg.base_dn)
+            entries += build_computers(ctx.hosts, self.base_dn, domain)
+        else:
+            self.base_dn = cfg.base_dn or _infer_base_dn(cfg.entries) or "DC=example,DC=local"
+            entries = []
+
+        # Replay raw captured entries verbatim (dn="" overrides the RootDSE).
+        root_override = None
+        for e in cfg.entries:
+            if e.dn == "":
+                root_override = e
+            else:
+                entries.append(Entry(e.dn, {k: list(v) for k, v in e.attributes.items()}))
+
         self.entries = entries
-        self.root_dse = _root_dse(self.base_dn, ctx.host_name, domain)
+        if root_override is not None:
+            self.root_dse = Entry("", {k: list(v) for k, v in root_override.attributes.items()})
+        else:
+            self.root_dse = _root_dse(self.base_dn, ctx.host_name, domain)
 
     @classmethod
     def from_config(cls, cfg: LdapConfig, ctx: FacadeContext) -> "LdapFacade":

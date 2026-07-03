@@ -54,9 +54,10 @@ def test_unknown_service_type():
         RangeConfig.model_validate(_base(services=[{"type": "quantumftp", "port": 21}]))
 
 
-def test_ldap_requires_identities():
-    with pytest.raises(ValidationError, match="requires top-level 'identities'"):
-        RangeConfig.model_validate(_base(services=[{"type": "ldap", "port": 389}]))
+def test_ldap_without_identities_is_valid():
+    # ldap now works with captured entries or an empty directory — no identities required.
+    cfg = RangeConfig.model_validate(_base(services=[{"type": "ldap", "port": 389}]))
+    assert cfg.hosts[0].services[0].type == "ldap"
 
 
 def test_extra_field_forbidden():

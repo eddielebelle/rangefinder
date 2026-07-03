@@ -57,6 +57,7 @@ rangefinder schema -o range.schema.json      # export JSON Schema for editor aut
 rangefinder gen examples/corp.json -o build/ # emit build/docker-compose.yml + config.json
 rangefinder import nmap scan.xml -o cfg.json      # discover topology from an nmap scan
 rangefinder capture http https://host/ -o cfg.json  # record a live web server -> faithful facade
+rangefinder capture ldap 10.0.0.10 -o cfg.json    # record a live directory -> faithful facade
 rangefinder score examples/acme.json log.jsonl   # score objectives against a telemetry log
 rangefinder run --host web01 --config examples/corp.json   # serve one host (container entrypoint)
 rangefinder up   -o build/                   # docker compose up -d  (thin wrapper)
@@ -121,7 +122,8 @@ nmap -sV -oX scan.xml 10.0.0.0/24
 rangefinder import nmap scan.xml --name prod-replica -o prod.json
 
 # 2. capture — record a live service's actual responses into a faithful facade
-rangefinder capture http https://10.0.0.30/ -o web.json          # verbatim (faithful twin)
+rangefinder capture http https://10.0.0.30/ -o web.json          # crawl -> http facade
+rangefinder capture ldap 10.0.0.10 -o dc.json                    # anonymous dir dump -> ldap facade
 rangefinder capture http https://10.0.0.30/ --scrub -o web.json  # redact secrets to share
 ```
 
@@ -139,7 +141,11 @@ for a range owned by the org it mirrors; `--scrub` runs bodies/headers through a
 best-effort redactor (emails, tokens, `password=…`) so the config can leave the org —
 structure stays faithful, so the weakness still carries through.
 
-(`capture http` is the first captor; LDAP/SMB capture follow the same record-replay shape.)
+`capture ldap` binds (anonymously by default), reads the RootDSE, and subtree-searches each
+naming context — recording the entries the directory actually returned. If anonymous bind
+exposes the directory on the real DC, the replica exposes the same directory (users, groups,
+computer objects, a service account's leaked `description`); if it's locked down, the replica
+returns just as little. (`http` and `ldap` captors ship; SMB capture follows the same shape.)
 
 ## Scoring
 

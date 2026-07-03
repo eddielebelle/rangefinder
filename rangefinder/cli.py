@@ -60,6 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_http.add_argument("--scrub", action="store_true", help="redact captured secrets")
     p_cap_http.add_argument("--max", type=int, default=200, help="max paths to probe")
 
+    p_cap_ldap = capture_sub.add_parser("ldap", help="enumerate a live directory -> ldap facade")
+    p_cap_ldap.add_argument("host", help="host, host:port, or ldap(s)://host:port")
+    p_cap_ldap.add_argument("--port", type=int, default=None)
+    p_cap_ldap.add_argument("--tls", action="store_true", help="use LDAPS")
+    p_cap_ldap.add_argument("--bind-dn", default="", help="bind DN (default: anonymous)")
+    p_cap_ldap.add_argument("--password", default="")
+    p_cap_ldap.add_argument("-o", "--out", type=Path, default=None)
+    p_cap_ldap.add_argument("--name", default=None, help="range name")
+    p_cap_ldap.add_argument("--host-id", default=None)
+    p_cap_ldap.add_argument("--scrub", action="store_true", help="redact secret attributes")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -139,41 +150,40 @@ def cmd_gen(args) -> int:
 
 
 def cmd_capture(args) -> int:
-    import ipaddress
-    import re
     from urllib.parse import urlparse
 
-    if args.captor != "http":
+    if args.captor == "http":
+        from rangefinder.capture import capture_http
+
+        try:
+            service, warnings = capture_http(args.url, max_paths=args.max, scrub=args.scrub)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        parsed = urlparse(args.url if "://" in args.url else "http://" + args.url)
+        hostname = parsed.hostname or "target"
+        default_id = "web"
+    elif args.captor == "ldap":
+        from rangefinder.capture import capture_ldap
+
+        parsed = urlparse(args.host if "://" in args.host else "ldap://" + args.host)
+        hostname = parsed.hostname or "target"
+        tls = args.tls or parsed.scheme == "ldaps"
+        port = args.port or parsed.port or (636 if tls else 389)
+        try:
+            service, warnings = capture_ldap(
+                hostname, port, tls=tls, bind_dn=args.bind_dn,
+                password=args.password, scrub=args.scrub,
+            )
+        except (ValueError, OSError) as exc:
+            print(f"error: LDAP capture failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        default_id = "dc"
+    else:
         print(f"error: unknown captor {args.captor!r}", file=sys.stderr)
         return EXIT_ERROR
 
-    from rangefinder.capture import capture_http
-
-    try:
-        service, warnings = capture_http(args.url, max_paths=args.max, scrub=args.scrub)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_ERROR
-
-    parsed = urlparse(args.url if "://" in args.url else "http://" + args.url)
-    hostname = parsed.hostname or "target"
-    try:
-        ip = str(ipaddress.ip_address(hostname))
-        subnet = f"{ipaddress.ip_network(ip + '/24', strict=False)}"
-    except ValueError:
-        ip = "10.99.0.10"
-        subnet = "10.99.0.0/24"
-        warnings.append(f"target is a hostname; assigned placeholder IP {ip} (edit as needed)")
-
-    host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.split(".")[0].lower()).strip("-") or "web")
-    name = re.sub(r"[^a-z0-9_-]", "-", (args.name or hostname).lower()).strip("-_") or "captured"
-
-    config = {
-        "name": name[:62],
-        "network": {"subnet": subnet},
-        "hosts": [{"id": host_id[:63], "hostname": hostname, "ip": ip,
-                   "os": "generic_linux", "services": [service]}],
-    }
+    config = _capture_config(service, hostname, args, warnings, default_id)
     try:
         RangeConfig.model_validate(config)
     except Exception as exc:
@@ -189,6 +199,28 @@ def cmd_capture(args) -> int:
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
     return EXIT_OK
+
+
+def _capture_config(service, hostname, args, warnings, default_id) -> dict:
+    import ipaddress
+    import re
+
+    try:
+        ip = str(ipaddress.ip_address(hostname))
+        subnet = str(ipaddress.ip_network(ip + "/24", strict=False))
+    except ValueError:
+        ip = "10.99.0.10"
+        subnet = "10.99.0.0/24"
+        warnings.append(f"target is a hostname; assigned placeholder IP {ip} (edit as needed)")
+
+    host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.split(".")[0].lower()).strip("-") or default_id)
+    name = re.sub(r"[^a-z0-9_-]", "-", (args.name or hostname).lower()).strip("-_") or "captured"
+    return {
+        "name": name[:62],
+        "network": {"subnet": subnet},
+        "hosts": [{"id": host_id[:63], "hostname": hostname, "ip": ip,
+                   "os": "generic_linux", "services": [service]}],
+    }
 
 
 def cmd_import(args) -> int:
