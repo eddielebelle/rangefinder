@@ -119,6 +119,50 @@ def build_directory(identities, hostname: str, base_dn: str | None) -> tuple[str
     return base, entries
 
 
+_OS_STRINGS = {
+    "windows_server_2019": "Windows Server 2019 Standard",
+    "windows_server_2022": "Windows Server 2022 Standard",
+    "windows_10": "Windows 10 Pro",
+    "windows_11": "Windows 11 Pro",
+}
+
+
+def build_computers(hosts, base: str, domain: str) -> list[Entry]:
+    """Render Windows range hosts as AD computer objects (DCs under an OU)."""
+    win = [h for h in hosts if h.os.value.startswith("windows")]
+    if not win:
+        return []
+
+    computers_dn = f"CN=Computers,{base}"
+    dc_ou = f"OU=Domain Controllers,{base}"
+    entries = [
+        Entry(computers_dn, {"objectClass": ["top", "container"], "cn": ["Computers"],
+                             "distinguishedName": [computers_dn]}),
+    ]
+    if any("domain-controller" in h.tags for h in win):
+        entries.append(Entry(dc_ou, {"objectClass": ["top", "organizationalUnit"],
+                                     "ou": ["Domain Controllers"], "distinguishedName": [dc_ou]}))
+
+    for h in win:
+        is_dc = "domain-controller" in h.tags
+        parent = dc_ou if is_dc else computers_dn
+        name = h.hostname.upper()
+        dn = f"CN={name},{parent}"
+        fqdn = f"{h.hostname.lower()}.{domain}" if domain else h.hostname.lower()
+        entries.append(Entry(dn, {
+            "objectClass": ["top", "person", "organizationalPerson", "user", "computer"],
+            "cn": [name],
+            "name": [name],
+            "sAMAccountName": [f"{name}$"],
+            "dNSHostName": [fqdn],
+            "operatingSystem": [_OS_STRINGS.get(h.os.value, "Windows")],
+            "distinguishedName": [dn],
+            # DCs: server trust account; members: workstation/server trust account.
+            "userAccountControl": ["532480" if is_dc else "4096"],
+        }))
+    return entries
+
+
 def _root_dse(base: str, hostname: str, domain: str) -> Entry:
     fqdn = f"{hostname.lower()}.{domain}" if domain else hostname.lower()
     return Entry(
@@ -267,6 +311,7 @@ class LdapFacade(Facade):
         identities = ctx.identities
         domain = identities.domain if identities else ""
         self.base_dn, entries = build_directory(identities, ctx.host_name, cfg.base_dn)
+        entries += build_computers(ctx.hosts, self.base_dn, domain)
         self.entries = entries
         self.root_dse = _root_dse(self.base_dn, ctx.host_name, domain)
 

@@ -175,12 +175,13 @@ def _build_records(cfg: DnsConfig, zone: str, ctx: FacadeContext) -> dict[str, l
         add(_qualify(rec.name, zone), code, rec.value, rec.ttl)
 
     if cfg.autofill_hosts and zone:
-        for hostname, ip in ctx.hosts:
-            fqdn = _qualify(hostname, zone)
+        for host in ctx.hosts:
+            ip = str(host.ip)
+            fqdn = _qualify(host.hostname, zone)
             # Don't clobber an explicit A record for the same name.
             if not any(c == 1 for c, _, _ in records.get(fqdn.lower(), [])):
-                family = socket.AF_INET6 if ":" in ip else socket.AF_INET
-                add(fqdn, 28 if family == socket.AF_INET6 else 1, ip, 300)
+                is_v6 = ":" in ip
+                add(fqdn, 28 if is_v6 else 1, ip, 300)
 
     return records
 

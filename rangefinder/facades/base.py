@@ -18,7 +18,7 @@ from rangefinder.telemetry import event as ev
 from rangefinder.telemetry.emitter import Emitter
 
 if TYPE_CHECKING:
-    from rangefinder.config.model import Identities
+    from rangefinder.config.model import Host, Identities
 
 # Benign connection outcomes produced constantly by scanners; not worth logging as errors.
 _BENIGN = (
@@ -41,9 +41,9 @@ class FacadeContext:
     # Range-level AD identities, rendered by the LDAP facade. None when the range has no
     # identities block (facades that don't need it ignore this).
     identities: "Identities | None" = None
-    # (hostname, ip) for every host in the range, used by the DNS facade to autofill A
-    # records for the zone.
-    hosts: tuple[tuple[str, str], ...] = ()
+    # Every host in the range: used by the DNS facade for A-record autofill and by the
+    # LDAP facade to render computer objects.
+    hosts: "tuple[Host, ...]" = ()
 
 
 @dataclass

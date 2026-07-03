@@ -37,6 +37,29 @@ def _identities():
 # ---------------------------------------------------------------- directory + filters
 
 
+def test_build_computers():
+    from rangefinder.config.model import Host
+    from rangefinder.facades.ldap import build_computers
+
+    hosts = [
+        Host(id="dc01", hostname="DC01", ip="10.20.0.10", os="windows_server_2022",
+             tags=["domain-controller"], services=[{"type": "ldap", "port": 389}]),
+        Host(id="ws01", hostname="WS01", ip="10.20.0.101", os="windows_11",
+             services=[{"type": "banner", "port": 445, "banner": "x"}]),
+        Host(id="web01", hostname="WEB01", ip="10.20.0.30", os="ubuntu_22_04",
+             services=[{"type": "http", "port": 80}]),
+    ]
+    entries = build_computers(hosts, "DC=acme,DC=corp", "acme.corp")
+    dns = [e.dn for e in entries]
+    # DC lands under the Domain Controllers OU; workstation under Computers; Linux excluded.
+    assert "CN=DC01,OU=Domain Controllers,DC=acme,DC=corp" in dns
+    assert "CN=WS01,CN=Computers,DC=acme,DC=corp" in dns
+    assert not any("WEB01" in d for d in dns)
+    dc = next(e for e in entries if e.dn.startswith("CN=DC01"))
+    assert dc.get("sAMAccountName") == ["DC01$"]
+    assert dc.get("operatingSystem") == ["Windows Server 2022 Standard"]
+
+
 def test_build_directory():
     base, entries = build_directory(_identities(), "DC01", None)
     assert base == "DC=corp,DC=local"

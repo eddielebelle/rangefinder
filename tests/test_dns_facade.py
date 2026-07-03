@@ -6,8 +6,13 @@ from dataclasses import replace
 
 from helpers import make_ctx
 
+from rangefinder.config.model import Host
 from rangefinder.config.services import DnsConfig, DnsRecord
 from rangefinder.facades.dns import DnsFacade, _decode_name, _encode_name
+
+
+def _host(hid, ip):
+    return Host(id=hid, hostname=hid, ip=ip, services=[{"type": "banner", "port": 9, "banner": "x"}])
 
 
 def _cfg():
@@ -24,7 +29,7 @@ def _cfg():
 
 def _ctx():
     ctx, sink = make_ctx()
-    return replace(ctx, hosts=(("dc01", "10.13.37.10"), ("web01", "10.13.37.20"))), sink
+    return replace(ctx, hosts=(_host("dc01", "10.13.37.10"), _host("web01", "10.13.37.20"))), sink
 
 
 def _facade():

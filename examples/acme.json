@@ -43,7 +43,15 @@
         { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
         { "type": "ldap", "port": 636, "tls": true, "allow_anonymous_bind": true },
-        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "smb", "port": 445, "server_os": "Windows Server 2022 Standard 20348",
+          "shares": [
+            { "name": "SYSVOL", "comment": "Logon server share", "readonly": true,
+              "files": {
+                "acme.corp/scripts/logon.bat": "net use H: \\\\fs01\\home\\%USERNAME% /persistent:no\r\n",
+                "acme.corp/Policies/{31B2F340-016D-11D2-945F-00C04FB984F9}/GPT.INI": "[General]\r\nVersion=42\r\n"
+              } },
+            { "name": "NETLOGON", "comment": "Logon server share", "readonly": true }
+          ] },
         { "type": "banner", "port": 464, "protocol": "kpasswd5", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3268, "protocol": "ldap", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
