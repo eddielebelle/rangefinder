@@ -157,7 +157,9 @@
       "id": "ws01", "hostname": "WS01", "ip": "10.20.0.101", "os": "windows_11",
       "tags": ["workstation"],
       "services": [
-        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "smb", "port": 445, "server_os": "Windows 11 Pro 22631",
+          "shares": [ { "name": "Users", "comment": "", "readonly": true,
+            "files": { "Public/Desktop/readme.txt": "This workstation is managed by ACME IT. Report issues to helpdesk@acme.corp.\n" } } ] },
         { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
           "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
@@ -166,7 +168,9 @@
       "id": "ws02", "hostname": "WS02", "ip": "10.20.0.102", "os": "windows_10",
       "tags": ["workstation"],
       "services": [
-        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "smb", "port": 445, "server_os": "Windows 10 Pro 19045",
+          "shares": [ { "name": "Users", "comment": "", "readonly": true,
+            "files": { "Public/Desktop/readme.txt": "This workstation is managed by ACME IT. Report issues to helpdesk@acme.corp.\n" } } ] },
         { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
           "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
