@@ -18,6 +18,7 @@ control. It renders a directory for enumeration.
 from __future__ import annotations
 
 import asyncio
+import datetime
 from dataclasses import dataclass, field
 
 from pyasn1.codec.ber import decoder, encoder
@@ -131,7 +132,79 @@ def build_directory(identities, hostname: str, base_dn: str | None) -> tuple[str
             attrs["member"] = members
         entries.append(Entry(dn, attrs))
 
+    existing_sams = {u.sam.lower() for u in identities.users}
+    existing_groups = {g.name.lower() for g in identities.groups}
+    entries += _baseline_entries(base, existing_sams, existing_groups)
     return base, entries
+
+
+# Well-known objects every real domain ships — their absence (no krbtgt, no Guest, no
+# CN=Builtin) is a giveaway that a directory is hand-built. Rendered alongside the
+# configured identities so an AD range enumerates like a genuine domain.
+_BUILTIN_GROUPS = [
+    ("Administrators", "Administrators have complete and unrestricted access to the computer/domain"),
+    ("Users", "Users are prevented from making accidental or intentional system-wide changes"),
+    ("Guests", "Guests have the same access as members of the Users group by default"),
+    ("Backup Operators", "Backup Operators can override security restrictions to back up or restore files"),
+    ("Remote Desktop Users", "Members are granted the right to log on remotely"),
+    ("Account Operators", "Members can administer domain user and group accounts"),
+    ("Server Operators", "Members can administer domain servers"),
+    ("Print Operators", "Members can administer printers installed on domain controllers"),
+    ("Replicator", "Supports file replication in a domain"),
+    ("Pre-Windows 2000 Compatible Access", "A backward compatibility group allowing read access on all users and groups"),
+]
+_DOMAIN_GROUPS = [
+    ("Domain Users", "All domain users"),
+    ("Domain Computers", "All workstations and servers joined to the domain"),
+    ("Domain Guests", "All domain guests"),
+    ("Domain Controllers", "All domain controllers in the domain"),
+    ("Cert Publishers", "Members are permitted to publish certificates to the directory"),
+    ("Group Policy Creator Owners", "Members can modify group policy for the domain"),
+    ("DnsAdmins", "DNS Administrators Group"),
+]
+_WELL_KNOWN_ACCOUNTS = [
+    ("krbtgt", 514, "Key Distribution Center Service Account"),
+    ("Guest", 66082, "Built-in account for guest access to the computer/domain"),
+    ("Administrator", 66048, "Built-in account for administering the computer/domain"),
+]
+
+
+def _baseline_entries(base: str, existing_sams: set, existing_groups: set) -> list[Entry]:
+    users_dn = f"CN=Users,{base}"
+    builtin_dn = f"CN=Builtin,{base}"
+    out: list[Entry] = []
+
+    for cn, oc in [("Builtin", "builtinDomain"), ("Computers", "container"),
+                   ("System", "container"), ("ForeignSecurityPrincipals", "container"),
+                   ("Managed Service Accounts", "container"), ("Program Data", "container")]:
+        dn = f"CN={cn},{base}"
+        out.append(Entry(dn, {"objectClass": ["top", oc], "cn": [cn],
+                              "distinguishedName": [dn], "isCriticalSystemObject": ["TRUE"]}))
+
+    for sam, uac, desc in _WELL_KNOWN_ACCOUNTS:
+        if sam.lower() in existing_sams:
+            continue
+        dn = f"CN={sam},{users_dn}"
+        out.append(Entry(dn, {
+            "objectClass": ["top", "person", "organizationalPerson", "user"],
+            "cn": [sam], "name": [sam], "sAMAccountName": [sam], "distinguishedName": [dn],
+            "userAccountControl": [str(uac)], "description": [desc],
+            "isCriticalSystemObject": ["TRUE"]}))
+
+    for name, desc in _BUILTIN_GROUPS:
+        dn = f"CN={name},{builtin_dn}"
+        out.append(Entry(dn, {"objectClass": ["top", "group"], "cn": [name], "name": [name],
+            "sAMAccountName": [name], "distinguishedName": [dn], "groupType": ["-2147483643"],
+            "description": [desc], "isCriticalSystemObject": ["TRUE"]}))
+
+    for name, desc in _DOMAIN_GROUPS:
+        if name.lower() in existing_groups:
+            continue
+        dn = f"CN={name},{users_dn}"
+        out.append(Entry(dn, {"objectClass": ["top", "group"], "cn": [name], "name": [name],
+            "sAMAccountName": [name], "distinguishedName": [dn], "groupType": ["-2147483646"],
+            "description": [desc], "isCriticalSystemObject": ["TRUE"]}))
+    return out
 
 
 _OS_STRINGS = {
@@ -178,21 +251,55 @@ def build_computers(hosts, base: str, domain: str) -> list[Entry]:
     return entries
 
 
+# Control / capability OIDs a real AD DC advertises in its RootDSE. A RootDSE that answers
+# only a handful of naming-context attributes is a tell; these are what tooling expects.
+_SUPPORTED_CONTROLS = [
+    "1.2.840.113556.1.4.319", "1.2.840.113556.1.4.801", "1.2.840.113556.1.4.473",
+    "1.2.840.113556.1.4.528", "1.2.840.113556.1.4.417", "1.2.840.113556.1.4.1338",
+    "1.2.840.113556.1.4.474", "1.2.840.113556.1.4.1339", "1.2.840.113556.1.4.1413",
+    "2.16.840.1.113730.3.4.9", "1.2.840.113556.1.4.1504", "1.2.840.113556.1.4.1852",
+    "1.2.840.113556.1.4.802", "1.2.840.113556.1.4.1907", "1.2.840.113556.1.4.1948",
+]
+_SUPPORTED_CAPABILITIES = [
+    "1.2.840.113556.1.4.800", "1.2.840.113556.1.4.1670", "1.2.840.113556.1.4.1791",
+    "1.2.840.113556.1.4.1935", "1.2.840.113556.1.4.2080", "1.2.840.113556.1.4.2237",
+]
+
+
+def _ldap_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S.0Z")
+
+
 def _root_dse(base: str, hostname: str, domain: str) -> Entry:
     fqdn = f"{hostname.lower()}.{domain}" if domain else hostname.lower()
+    server = hostname.upper()
+    cfg = f"CN=Configuration,{base}"
+    sites = f"CN=Default-First-Site-Name,CN=Sites,{cfg}"
     return Entry(
         "",
         {
             "objectClass": ["top"],
-            "namingContexts": [base, f"CN=Configuration,{base}"],
+            "namingContexts": [base, cfg, f"CN=Schema,{cfg}",
+                               f"DC=DomainDnsZones,{base}", f"DC=ForestDnsZones,{base}"],
             "defaultNamingContext": [base],
             "rootDomainNamingContext": [base],
-            "configurationNamingContext": [f"CN=Configuration,{base}"],
-            "schemaNamingContext": [f"CN=Schema,CN=Configuration,{base}"],
-            "supportedLDAPVersion": ["3"],
+            "configurationNamingContext": [cfg],
+            "schemaNamingContext": [f"CN=Schema,{cfg}"],
+            "subschemaSubentry": [f"CN=Aggregate,CN=Schema,{cfg}"],
+            "supportedLDAPVersion": ["3", "2"],
+            "supportedControl": _SUPPORTED_CONTROLS,
+            "supportedSASLMechanisms": ["GSSAPI", "GSS-SPNEGO", "EXTERNAL", "DIGEST-MD5"],
+            "supportedCapabilities": _SUPPORTED_CAPABILITIES,
             "dnsHostName": [fqdn],
-            "serverName": [f"CN={hostname.upper()},CN=Servers,{base}"],
-            "dsServiceName": [f"CN=NTDS Settings,CN={hostname.upper()},{base}"],
+            "serverName": [f"CN={server},CN=Servers,{sites}"],
+            "dsServiceName": [f"CN=NTDS Settings,CN={server},CN=Servers,{sites}"],
+            "ldapServiceName": [f"{domain}:{server}$@{domain.upper()}" if domain else server],
+            "isSynchronized": ["TRUE"],
+            "isGlobalCatalogReady": ["TRUE"],
+            "highestCommittedUSN": ["163994"],
+            "domainFunctionality": ["7"],
+            "forestFunctionality": ["7"],
+            "domainControllerFunctionality": ["7"],
         },
     )
 
@@ -354,7 +461,16 @@ class LdapFacade(Facade):
             else:
                 entries.append(Entry(e.dn, {k: list(v) for k, v in e.attributes.items()}))
 
-        self.entries = entries
+        # Dedup by DN (build_directory and build_computers can both emit CN=Computers, etc.),
+        # keeping the first — the richer baseline container over the bare one.
+        seen: set = set()
+        self.entries = []
+        for e in entries:
+            key = _norm(e.dn)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.entries.append(e)
         if root_override is not None:
             self.root_dse = Entry("", {k: list(v) for k, v in root_override.attributes.items()})
         else:
@@ -558,9 +674,10 @@ class LdapFacade(Facade):
         requested = [str(a) for a in req["attributes"]]
         filt = req["filter"]
 
-        # RootDSE: empty base + base scope is the client's first question.
+        # RootDSE: empty base + base scope is the client's first question. currentTime is an
+        # operational attribute that must be live, so inject it fresh per query.
         if base == "" and scope_i == 0:
-            candidates = [self.root_dse]
+            candidates = [Entry("", {**self.root_dse.attrs, "currentTime": [_ldap_now()]})]
         else:
             candidates = [
                 e

@@ -183,7 +183,12 @@ def test_rootdse_query():
     assert len(entries) == 1
     attrs = {str(a["type"]): [str(v) for v in a["vals"]] for a in entries[0]["protocolOp"]["searchResEntry"]["attributes"]}
     assert attrs["defaultNamingContext"] == ["DC=corp,DC=local"]
-    assert attrs["supportedLDAPVersion"] == ["3"]
+    assert attrs["supportedLDAPVersion"] == ["3", "2"]
+    # real-DC operational attributes tooling expects (not a whitelist stub)
+    assert "1.2.840.113556.1.4.319" in attrs["supportedControl"]  # paged results
+    assert "GSSAPI" in attrs["supportedSASLMechanisms"]
+    assert attrs["currentTime"]  # live, injected per query
+    assert attrs["domainFunctionality"] == ["7"]
 
 
 def test_subtree_search_returns_users_and_groups():
@@ -214,3 +219,22 @@ def _sam(resp):
         if str(a["type"]).lower() == "samaccountname":
             return str(a["vals"][0])
     return None
+
+
+def test_baseline_ad_objects_present():
+    """A real domain ships krbtgt, Guest, CN=Builtin + builtin groups, Domain Users — their
+    absence is a decoy tell. Identity-provided accounts are not duplicated by the baseline."""
+    reqs = [_bind_request(), _search_request(2, "DC=corp,DC=local", 2, _present_filter("objectClass"))]
+    responses, _ = asyncio.run(_run_ldap_session(reqs))
+    dns = [str(r["protocolOp"]["searchResEntry"]["objectName"]).lower()
+           for r in responses if r["protocolOp"].getName() == "searchResEntry"]
+    for expected in [
+        "cn=krbtgt,cn=users,dc=corp,dc=local",
+        "cn=guest,cn=users,dc=corp,dc=local",
+        "cn=builtin,dc=corp,dc=local",
+        "cn=administrators,cn=builtin,dc=corp,dc=local",
+        "cn=domain users,cn=users,dc=corp,dc=local",
+        "cn=system,dc=corp,dc=local",
+    ]:
+        assert expected in dns, expected
+    assert dns.count("cn=administrator,cn=users,dc=corp,dc=local") == 1  # not duplicated
