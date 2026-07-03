@@ -108,6 +108,35 @@ Example event (an HTTP hit on a planted vuln):
 "rangefinder":{"vuln_id":"exposed-git-dir","conn_id":"..."}}
 ```
 
+## Importing real infrastructure
+
+To build a range that mirrors a real environment (for detection testing against *your*
+network), import an nmap scan:
+
+```bash
+nmap -sV -sC -oX scan.xml 10.0.0.0/24        # -sC / --script drives the posture layer
+rangefinder import nmap scan.xml --name prod-replica -o prod.json
+rangefinder validate prod.json               # then gen + up as usual
+```
+
+The importer produces two layers:
+
+- **Topology + versions** — each up host → a range host; each open port → a facade
+  (http/https → `http`, ssh → `ssh`, else a labelled `banner` decoy with the detected
+  version). Subnet is derived from the host IPs (`--subnet` to override).
+- **Security posture** — nmap NSE `<script>` output is translated into config that
+  *reproduces the misconfigurations found*: exposed web paths (`http-git`, `http-enum`)
+  become planted routes tagged as vulns; null-session SMB shares (`smb-enum-shares`)
+  become a real `smb` facade; and each finding (anonymous LDAP/FTP, weak TLS,
+  unauthenticated Redis/Mongo, …) becomes an auto-generated **objective** — so the
+  imported range ships with a scorecard of the org's real weaknesses.
+
+**Posture, not data.** The importer captures the *property* of a weakness (a path is
+exposed, a share is null-session readable, LDAP answers anonymously) and structural
+names/paths — never bulk data or secret values. Share contents are placeholdered. This
+keeps the replica safe to share while still faithful to what a defender needs to detect.
+Run nmap with NSE scripts to populate the posture layer; a bare `-sV` yields topology only.
+
 ## Scoring
 
 Scoring is a **separate reader** of the telemetry — the facades keep emitting the full

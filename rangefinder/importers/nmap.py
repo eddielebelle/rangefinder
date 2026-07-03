@@ -1,16 +1,19 @@
 """Generate a rangefinder config from an nmap ``-oX`` scan of real infrastructure.
 
-Maps each up host to a range host and each open TCP port to a facade: http/https ->
-``http`` (server header from the detected product), ssh -> ``ssh`` (real facade,
-server_version reconstructed), a few text protocols (ftp/smtp/imap/pop3) -> a ``banner``
-with a synthesized greeting, and everything else -> a labelled empty ``banner`` decoy
-(port open, service named by port). The result recreates topology + the enumeration
-surface; it does not reproduce real behavior or data.
+Two layers:
 
-Fidelity note: a standard ``-sV`` XML rarely carries the raw banner bytes, so non-http/ssh
-services are reproduced as "open port, right service label" rather than exact-version. For
-higher fidelity, capture banners explicitly (``--script banner``) and hand-edit, or extend
-this importer.
+1. **Topology + versions** — each up host becomes a range host and each open TCP port a
+   facade (http/https -> ``http``, ssh -> ``ssh``, else a labelled ``banner`` decoy).
+2. **Security posture** — nmap NSE ``<script>`` output is translated into faithful config
+   that reproduces the *misconfigurations* found (exposed web paths -> planted routes;
+   null-session SMB shares -> a real ``smb`` facade), and into auto-generated
+   ``objectives`` so the imported range ships with a scorecard of the real weaknesses.
+
+Posture vs. data: this captures the *property* of a weakness (a path is exposed, a share
+is null-session readable, LDAP answers anonymously) and structural names/paths, but never
+bulk data or secret values — share contents are placeholdered. Run nmap with NSE scripts
+(``-sV -sC`` or targeted ``--script http-enum,http-git,smb-enum-shares,...``) to populate
+the posture layer; a bare ``-sV`` yields only the topology layer.
 """
 
 from __future__ import annotations
@@ -24,6 +27,15 @@ from rangefinder.config.model import RangeConfig
 
 _HTTP_PORTS = {80, 8080, 8000, 8888}
 _TLS_HTTP_PORTS = {443, 8443}
+
+# Web paths whose exposure is security-relevant (tagged as vulns + scored).
+_SENSITIVE_PATH = re.compile(
+    r"(/\.git|/\.svn|/\.env|/\.aws|backup|/admin|phpmyadmin|phpmyadmin|/config|"
+    r"\.sql|\.bak|/wp-login|/wp-admin|/server-status|/actuator|/\.ht)",
+    re.IGNORECASE,
+)
+_PATH_RE = re.compile(r"(/[A-Za-z0-9_./~-]+)")
+_MAX_ROUTES_PER_HOST = 40
 
 
 def import_nmap(
@@ -42,6 +54,7 @@ def import_nmap(
 
     warnings: list[str] = []
     hosts: list[dict] = []
+    objectives: list[dict] = []
     used_ids: set[str] = set()
     facade_counts: dict[str, int] = {}
     skipped = 0
@@ -50,7 +63,6 @@ def import_nmap(
         status = host_el.find("status")
         if status is not None and status.get("state") != "up":
             continue
-
         ip = _ipv4(host_el)
         if ip is None:
             skipped += 1
@@ -58,12 +70,17 @@ def import_nmap(
             continue
 
         hostname = _hostname(host_el)
-        services = _services(host_el, hostname or ip, facade_counts)
+        host_id = _make_id(hostname, ip, used_ids)
+        hostscript = host_el.find("hostscript")
+        host_scripts = _scripts(hostscript) if hostscript is not None else {}
+        services = _services(
+            host_el, host_id, hostname or ip, facade_counts, objectives, host_scripts
+        )
         if not services:
             skipped += 1
+            used_ids.discard(host_id)
             continue
 
-        host_id = _make_id(hostname, ip, used_ids)
         hosts.append({
             "id": host_id,
             "hostname": hostname or ip,
@@ -75,30 +92,38 @@ def import_nmap(
     if not hosts:
         raise ValueError("no usable hosts with open ports found in the scan")
 
+    # Deduplicate objectives by id (host scripts can be evaluated against multiple ports).
+    seen: set[str] = set()
+    objectives = [o for o in objectives if not (o["id"] in seen or seen.add(o["id"]))]
+
     net = _subnet(subnet, [h["ip"] for h in hosts], warnings)
-    config = {
+    config: dict = {
         "name": _sanitize_name(name),
         "network": {"subnet": str(net)},
         "hosts": hosts,
     }
+    if objectives:
+        config["objectives"] = objectives
 
-    # Validate so the caller gets clear errors before writing anything.
     try:
         RangeConfig.model_validate(config)
     except Exception as exc:  # pydantic ValidationError
         raise ValueError(f"generated config is invalid: {exc}") from exc
 
+    scoreable = sum(1 for o in objectives if o.get("detect"))
     summary = {
         "hosts": len(hosts),
         "services": sum(len(h["services"]) for h in hosts),
         "facades": dict(sorted(facade_counts.items())),
         "skipped_hosts": skipped,
         "subnet": str(net),
+        "misconfigs": len(objectives),
+        "scoreable_objectives": scoreable,
     }
     return config, summary, warnings
 
 
-# --------------------------------------------------------------------------- helpers
+# ------------------------------------------------------------------- host/port basics
 
 
 def _ipv4(host_el) -> str | None:
@@ -136,7 +161,15 @@ def _map_os(host_el) -> str:
     return "generic_linux"
 
 
-def _services(host_el, host_label: str, counts: dict[str, int]) -> list[dict]:
+def _scripts(el) -> dict[str, str]:
+    """Collect {script-id: output} from <script> children of a port or host."""
+    out: dict[str, str] = {}
+    for scr in el.findall("script"):
+        out[scr.get("id", "")] = scr.get("output", "") or ""
+    return out
+
+
+def _services(host_el, host_id, host_label, counts, objectives, host_scripts) -> list[dict]:
     services: list[dict] = []
     seen_ports: set[int] = set()
     for port_el in host_el.findall("ports/port"):
@@ -151,7 +184,10 @@ def _services(host_el, host_label: str, counts: dict[str, int]) -> list[dict]:
         seen_ports.add(portid)
 
         svc = port_el.find("service")
+        # Host scripts (e.g. smb-enum-shares) apply to the relevant port too.
+        scripts = {**host_scripts, **_scripts(port_el)}
         cfg = _facade_for(portid, svc, host_label)
+        cfg = _apply_posture(cfg, portid, scripts, host_id, host_label, objectives)
         counts[cfg["type"]] = counts.get(cfg["type"], 0) + 1
         services.append(cfg)
     return services
@@ -162,10 +198,10 @@ def _facade_for(portid: int, svc, host_label: str) -> dict:
     product = svc.get("product", "") if svc is not None else ""
     version = svc.get("version", "") if svc is not None else ""
     tunnel = svc.get("tunnel", "") if svc is not None else ""
-
     server_header = " ".join(p for p in (product, version) if p).strip()
 
-    if name in ("https",) or tunnel == "ssl" and (name.startswith("http") or portid in _TLS_HTTP_PORTS) or portid in _TLS_HTTP_PORTS:
+    is_tls = tunnel == "ssl" or name == "https"
+    if name == "https" or (is_tls and name.startswith("http")) or portid in _TLS_HTTP_PORTS:
         cfg = {"type": "http", "port": portid, "tls": True}
         if server_header:
             cfg["server_header"] = server_header
@@ -182,7 +218,6 @@ def _facade_for(portid: int, svc, host_label: str) -> dict:
             cfg["server_version"] = sv
         return cfg
 
-    # Generic: a banner decoy labelled with the detected service name.
     cfg = {"type": "banner", "port": portid, "protocol": name or "tcp"}
     banner = _text_banner(name, product, version, host_label)
     if banner is not None:
@@ -206,6 +241,172 @@ def _text_banner(name: str, product: str, version: str, host_label: str) -> str 
     return None
 
 
+# ----------------------------------------------------------------- posture / misconfig
+
+
+def _apply_posture(cfg, portid, scripts, host_id, host_label, objectives) -> dict:
+    """Enrich a facade with misconfigs found by NSE scripts; append scored objectives."""
+    if not scripts:
+        return cfg
+
+    if cfg["type"] == "http":
+        routes = _http_exposed_routes(scripts, host_id, objectives)
+        if routes:
+            cfg.setdefault("paths", {}).update(routes)
+
+    # Promote a null-session SMB port to a real smb facade reproducing the shares.
+    if portid == 445 or cfg.get("protocol") in ("microsoft-ds", "netbios-ssn"):
+        smb = _smb_from_scripts(scripts, host_id, objectives)
+        if smb is not None:
+            smb["port"] = portid
+            cfg = smb
+
+    # Record misconfigs we flag but do not fully reproduce behaviorally.
+    if _has(scripts, "ldap-rootdse") or _has(scripts, "ldap-search"):
+        objectives.append(_objective(
+            f"{host_id}-ldap-anon", f"Anonymous LDAP on {host_id}",
+            "LDAP answered unauthenticated (anonymous bind) queries.",
+        ))
+    if _output(scripts, "ftp-anon", "anonymous ftp login allowed"):
+        objectives.append(_objective(
+            f"{host_id}-ftp-anon", f"Anonymous FTP on {host_id}",
+            "The FTP service permits anonymous login.",
+        ))
+    if _output(scripts, "ssl-cert", "self-signed") or _output(scripts, "ssl-cert", "expired"):
+        objectives.append(_objective(
+            f"{host_id}-weak-tls", f"Weak TLS certificate on {host_id}",
+            "The service presents a self-signed or expired certificate.",
+        ))
+    for svc_name in ("redis-info", "mongodb-info", "elasticsearch"):
+        if _has(scripts, svc_name):
+            objectives.append(_objective(
+                f"{host_id}-{svc_name}-unauth", f"Unauthenticated {svc_name.split('-')[0]} on {host_id}",
+                f"The {svc_name.split('-')[0]} service responded without authentication.",
+            ))
+    return cfg
+
+
+def _http_exposed_routes(scripts, host_id, objectives) -> dict:
+    routes: dict[str, dict] = {}
+    for sid, out in scripts.items():
+        low = out.lower()
+        if "git" in sid and ".git" in low:
+            routes["/.git/HEAD"] = {
+                "content_type": "text/plain; charset=utf-8",
+                "body": "ref: refs/heads/main\n",
+                "vuln_id": "exposed-git-repo",
+            }
+            objectives.append(_objective(
+                f"{host_id}-exposed-git", f"Exposed .git repository on {host_id}",
+                "An unauthenticated .git directory is reachable over HTTP.",
+                _detect_http("/.git"),
+            ))
+        if sid in ("http-enum", "http-robots.txt") or sid.startswith("http-"):
+            for path in _extract_paths(out):
+                if path in routes or len(routes) >= _MAX_ROUTES_PER_HOST:
+                    continue
+                route = {"body": "<!-- endpoint observed during discovery -->\n"}
+                if _SENSITIVE_PATH.search(path):
+                    slug = _slug(path)
+                    route["vuln_id"] = f"exposed-{slug}"
+                    objectives.append(_objective(
+                        f"{host_id}-exposed-{slug}", f"Exposed {path} on {host_id}",
+                        f"nmap enumeration found the sensitive path {path}.",
+                        _detect_http(path),
+                    ))
+                routes[path] = route
+    return routes
+
+
+def _extract_paths(output: str) -> list[str]:
+    paths: list[str] = []
+    for m in _PATH_RE.finditer(output):
+        p = m.group(1).rstrip("/") or "/"
+        if p in paths:
+            continue
+        if p.endswith((".js", ".css", ".png", ".jpg", ".gif", ".ico", ".woff")):
+            continue
+        if " " in p or len(p) > 120:
+            continue
+        # Require a letter after the leading slash so version numbers / counts
+        # ("/6", "/1.18.0") extracted from script prose are not treated as endpoints.
+        if not re.search(r"[A-Za-z]", p[1:]):
+            continue
+        paths.append(p)
+    return paths
+
+
+def _smb_from_scripts(scripts, host_id, objectives) -> dict | None:
+    enum = next((out for sid, out in scripts.items() if "enum-shares" in sid), None)
+    if not enum:
+        return None
+    names = _parse_share_names(enum)
+    if not names:
+        return None
+    shares = [
+        {"name": n, "comment": "imported (contents not captured)", "readonly": True,
+         "files": {"README.txt": "Placeholder — share contents are not imported.\n"}}
+        for n in names
+    ]
+    cfg: dict = {"type": "smb", "server_os": "Windows Server", "shares": shares}
+    weak_signing = any(
+        "security-mode" in sid and ("not required" in out.lower() or "disabled" in out.lower())
+        for sid, out in scripts.items()
+    )
+    if weak_signing:
+        cfg["signing_required"] = False
+    objectives.append(_objective(
+        f"{host_id}-smb-null-session", f"Null-session SMB shares on {host_id}",
+        "SMB shares are enumerable/readable without authentication.",
+        _detect_smb(),
+    ))
+    return cfg
+
+
+def _parse_share_names(output: str) -> list[str]:
+    names: list[str] = []
+    for m in re.finditer(r"\\\\[^\\\s]+\\([A-Za-z0-9$_.-]+)", output):
+        share = m.group(1)
+        if share.upper() == "IPC$":  # our smb facade adds IPC$ itself
+            continue
+        if share not in names:
+            names.append(share)
+    return names
+
+
+# --------------------------------------------------------------------- small builders
+
+
+def _objective(oid: str, title: str, description: str, detect: list | None = None) -> dict:
+    obj = {"id": oid, "title": title, "description": description}
+    if detect:
+        obj["detect"] = detect
+    return obj
+
+
+def _detect_http(path: str) -> list:
+    return [{"label": f"HTTP request to {path}",
+             "all": [{"field": "event.action", "equals": "http_request"},
+                     {"field": "url.path", "contains": path}]}]
+
+
+def _detect_smb() -> list:
+    return [{"label": "SMB file access",
+             "all": [{"field": "event.action", "equals": "smb_file_access"}]}]
+
+
+def _has(scripts: dict, script_id: str) -> bool:
+    return any(script_id in sid for sid in scripts)
+
+
+def _output(scripts: dict, script_id: str, needle: str) -> bool:
+    return any(script_id in sid and needle.lower() in out.lower() for sid, out in scripts.items())
+
+
+def _slug(path: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-") or "root"
+
+
 def _make_id(hostname: str | None, ip: str, used: set[str]) -> str:
     base = ""
     if hostname:
@@ -213,8 +414,7 @@ def _make_id(hostname: str | None, ip: str, used: set[str]) -> str:
     if not base:
         base = "h-" + ip.replace(".", "-")
     base = base[:63] or "host"
-    candidate = base
-    n = 2
+    candidate, n = base, 2
     while candidate in used:
         candidate = f"{base}-{n}"[:63]
         n += 1
@@ -227,7 +427,7 @@ def _sanitize_name(name: str) -> str:
     return (clean or "imported")[:62]
 
 
-def _subnet(explicit: str | None, ips: list[str], warnings: list[str]) -> ipaddress.IPv4Network:
+def _subnet(explicit, ips, warnings) -> ipaddress.IPv4Network:
     if explicit is not None:
         net = ipaddress.ip_network(explicit, strict=False)
         outside = [ip for ip in ips if ipaddress.ip_address(ip) not in net]
@@ -239,8 +439,7 @@ def _subnet(explicit: str | None, ips: list[str], warnings: list[str]) -> ipaddr
     xored = 0
     for value in ints[1:]:
         xored |= ints[0] ^ value
-    prefix = 32 - xored.bit_length()
-    prefix = min(prefix, 24)  # leave room for a gateway even with one/few hosts
+    prefix = min(32 - xored.bit_length(), 24)
     net = ipaddress.ip_network(f"{ips[0]}/{prefix}", strict=False)
     if net.overlaps(ipaddress.ip_network("172.16.0.0/12")):
         warnings.append(
