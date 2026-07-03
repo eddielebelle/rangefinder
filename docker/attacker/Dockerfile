@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ldap-utils \
         dnsutils \
         smbclient \
+        openssh-client \
+        sshpass \
         netcat-openbsd \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -96,7 +96,7 @@
       "id": "web01", "hostname": "WEB01", "ip": "10.20.0.30", "os": "ubuntu_22_04",
       "tags": ["dmz", "web"],
       "services": [
-        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
+        { "type": "ssh", "port": 22, "server_version": "OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
         { "type": "http", "port": 80, "server_header": "nginx/1.18.0 (Ubuntu)",
           "extra_headers": { "X-Powered-By": "PHP/8.1.2" },
           "default_status": 404,
@@ -122,7 +122,7 @@
       "id": "app01", "hostname": "APP01", "ip": "10.20.0.31", "os": "debian_12",
       "tags": ["app", "database"],
       "services": [
-        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2" },
+        { "type": "ssh", "port": 22, "server_version": "OpenSSH_9.2p1 Debian-2+deb12u2" },
         { "type": "http", "port": 8080, "server_header": "Werkzeug/2.3.7 Python/3.11.2",
           "paths": {
             "/": { "content_type": "application/json", "body": "{\"service\":\"acme-api\",\"version\":\"1.4.2\"}" },
@@ -140,7 +140,7 @@
       "id": "mail01", "hostname": "MAIL01", "ip": "10.20.0.40", "os": "ubuntu_22_04",
       "tags": ["mail"],
       "services": [
-        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
+        { "type": "ssh", "port": 22, "server_version": "OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
         { "type": "banner", "port": 25, "protocol": "smtp", "banner": "220 mail01.acme.corp ESMTP Postfix (Ubuntu)",
           "rules": [ { "match": "^EHLO", "respond": "250-mail01.acme.corp\r\n250 STARTTLS" },
                      { "match": "^QUIT", "respond": "221 Bye", "close_after": true } ] },
@@ -171,7 +171,9 @@
       "id": "jump01", "hostname": "JUMP01", "ip": "10.20.0.50", "os": "ubuntu_22_04",
       "tags": ["bastion"],
       "services": [
-        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" }
+        { "type": "ssh", "port": 22, "server_version": "OpenSSH_8.9p1 Ubuntu-3ubuntu0.6",
+          "accept_creds": { "admin": "acme123" },
+          "motd": "ACME bastion host - authorized access only. All sessions are recorded." }
       ]
     }
   ],

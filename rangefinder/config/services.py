@@ -86,6 +86,18 @@ class BannerRule(BaseModel):
     close_after: bool = False
 
 
+class SshConfig(ServiceBase):
+    """Real SSH server (asyncssh): performs KEX, captures + rejects auth attempts."""
+
+    type: Literal["ssh"] = "ssh"
+    port: int = Field(default=22, ge=1, le=65535)
+    server_version: str = "OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
+    # username -> password that are accepted (dropped into the decoy shell). Empty =
+    # reject everything (capture only).
+    accept_creds: dict[str, str] = Field(default_factory=dict)
+    motd: str = ""
+
+
 class BannerConfig(ServiceBase):
     """Generic server-speaks-first TCP facade (SSH/FTP/SMTP-style version detection).
 
@@ -157,9 +169,9 @@ class DnsConfig(ServiceBase):
 # route each object to the right model by its "type" key, and produces a JSON Schema
 # oneOf that editors use for per-variant autocomplete.
 BuiltinService = Annotated[
-    Union[HttpConfig, BannerConfig, LdapConfig, SmbConfig, DnsConfig],
+    Union[HttpConfig, BannerConfig, SshConfig, LdapConfig, SmbConfig, DnsConfig],
     Field(discriminator="type"),
 ]
 
 # Service types that have a working runtime facade in this release.
-IMPLEMENTED_TYPES = frozenset({"http", "banner", "ldap", "smb", "dns"})
+IMPLEMENTED_TYPES = frozenset({"http", "banner", "ssh", "ldap", "smb", "dns"})

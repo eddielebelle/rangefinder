@@ -16,9 +16,10 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 > SASL/StartTLS or writes. HTTP and LDAP serve over TLS with a self-signed cert (nmap
 > fingerprints it); other TLS ports (RDP, IMAPS, …) remain decoys for now. The
 > **SMB** facade (impacket-backed) serves the configured shares as real files and captures
-> NTLM auth attempts without validating them (`readonly` is advisory). Planted "vulns" are
-> canned decoys that answer scanners and populate telemetry; they are not exploitable. TCP
-> only (no UDP / `nmap -sU`).
+> NTLM auth attempts without validating them (`readonly` is advisory). The **SSH** facade
+> does a real key exchange and captures credential attempts, but its shell is a decoy (no
+> command execution). Planted "vulns" are canned decoys that answer scanners and populate
+> telemetry; they are not exploitable. TCP only (no UDP / `nmap -sU`).
 
 ## Install
 
@@ -33,16 +34,17 @@ A range config has four parts:
 - **network** — the subnet the range lives on.
 - **hosts** — each becomes one container with a static IP; each host has **services**.
 - **services** — a typed, discriminated list. Each `type` maps to a facade. Implemented:
-  `http`, `banner`, `ldap`, `smb`, `dns`.
-- **identities** / **objectives** — AD users/groups and scenario objectives. Descriptive
-  metadata in v1 (the LDAP facade will render `identities` in v2).
+  `http`, `banner`, `ssh`, `ldap`, `smb`, `dns`.
+- **identities** / **objectives** — AD users/groups (rendered by the LDAP facade) and
+  scenario objectives (descriptive metadata).
 
 ### Service types
 
 | type | facade | notes |
 |------|--------|-------|
 | `http` | HTTP/1.1(S) server | server header, canned route table, planted-vuln routes, HEAD, keep-alive. `tls: true` for HTTPS. Routes gate on Basic auth (`auth_realm`/`auth_users`) and every credential attempt is captured as telemetry |
-| `banner` | generic TCP banner | text banner + regex rules (SSH/FTP/SMTP), or `binary: true` with `banner_hex` / hex `match_hex`+`respond_hex` rules for binary protocols (MySQL greeting, RDP X.224) so nmap `-sV` versions them |
+| `banner` | generic TCP banner | text banner + regex rules (FTP/SMTP/POP3), or `binary: true` with `banner_hex` / hex `match_hex`+`respond_hex` rules for binary protocols (MySQL greeting, RDP X.224) so nmap `-sV` versions them |
+| `ssh` | real SSH server | asyncssh-backed: genuine key exchange, so clients reach auth. Captures every password/public-key attempt as telemetry and rejects it; `accept_creds` lets a planted login succeed into a decoy shell that logs typed commands. `server_version` sets the OpenSSH banner nmap reads |
 | `ldap` | LDAPv3(S) directory | real BER wire protocol; renders `identities` (users/groups) and the range's Windows hosts (computer objects + Domain Controllers OU) into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. `tls: true` serves LDAPS. Enumeration-grade (no cred validation / SASL / writes) |
 | `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
 | `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |

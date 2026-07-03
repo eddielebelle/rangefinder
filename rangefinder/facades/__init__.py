@@ -9,6 +9,7 @@ from rangefinder.facades import http as _http  # noqa: F401
 from rangefinder.facades import ldap as _ldap  # noqa: F401
 from rangefinder.facades import dns as _dns  # noqa: F401
 from rangefinder.facades import smb as _smb  # noqa: F401
+from rangefinder.facades import ssh as _ssh  # noqa: F401
 
 __all__ = [
     "Facade",

@@ -321,6 +321,62 @@ def dns_query(
     return _prune(ev)
 
 
+def ssh_connection(facade: Any, action: str, *, src_ip, src_port, conn_id) -> dict:
+    start = action == "connection_open"
+    ev = _envelope(
+        facade,
+        action=action,
+        category=["network"],
+        etype=["connection", "start" if start else "end"],
+        outcome="success",
+        src_ip=src_ip,
+        src_port=src_port,
+        conn_id=conn_id,
+    )
+    return _prune(ev)
+
+
+def ssh_auth(
+    facade: Any,
+    *,
+    src_ip,
+    src_port,
+    conn_id,
+    username: str,
+    method: str,
+    credential: str | None,
+    outcome: str,
+) -> dict:
+    """Captured SSH auth attempt (attacker-supplied username + password/key)."""
+    ev = _envelope(
+        facade,
+        action="ssh_auth",
+        category=["authentication"],
+        etype=["start"],
+        outcome=outcome,
+        src_ip=src_ip,
+        src_port=src_port,
+        conn_id=conn_id,
+    )
+    ev["rangefinder"]["auth"] = {"user": username, "method": method, "credential": credential}
+    return _prune(ev)
+
+
+def ssh_command(facade: Any, *, src_ip, src_port, conn_id, username: str, command: str) -> dict:
+    ev = _envelope(
+        facade,
+        action="ssh_command",
+        category=["process"],
+        etype=["info"],
+        outcome="success",
+        src_ip=src_ip,
+        src_port=src_port,
+        conn_id=conn_id,
+    )
+    ev["rangefinder"]["ssh"] = {"user": username, "command": command}
+    return _prune(ev)
+
+
 def smb_event(
     facade: Any,
     action: str,
