@@ -1,0 +1,165 @@
+{
+  "name": "acme",
+  "network": { "subnet": "10.20.0.0/24", "gateway": "10.20.0.1" },
+  "identities": {
+    "domain": "acme.corp",
+    "netbios": "ACME",
+    "groups": [
+      { "name": "Domain Admins", "members": ["administrator", "t.admin"] },
+      { "name": "Enterprise Admins", "members": ["administrator"] },
+      { "name": "IT", "members": ["t.admin", "h.desk"] },
+      { "name": "Finance", "members": ["a.jones", "m.patel"] },
+      { "name": "HR", "members": ["s.kaur"] },
+      { "name": "Backup Operators", "members": ["svc-backup"] }
+    ],
+    "users": [
+      { "sam": "administrator", "display_name": "Administrator", "groups": ["Domain Admins", "Enterprise Admins"] },
+      { "sam": "t.admin", "display_name": "Tom Admin", "upn": "t.admin@acme.corp", "groups": ["Domain Admins", "IT"] },
+      { "sam": "h.desk", "display_name": "Helen Desk", "upn": "h.desk@acme.corp", "groups": ["IT"] },
+      { "sam": "a.jones", "display_name": "Alice Jones", "upn": "a.jones@acme.corp", "groups": ["Finance"] },
+      { "sam": "m.patel", "display_name": "Meera Patel", "upn": "m.patel@acme.corp", "groups": ["Finance"] },
+      { "sam": "s.kaur", "display_name": "Simran Kaur", "upn": "s.kaur@acme.corp", "groups": ["HR"] },
+      { "sam": "svc-sql", "display_name": "SQL Service", "upn": "svc-sql@acme.corp", "groups": ["Domain Users"],
+        "description": "SQL Server service account - pwd Summ3r2025! (rotate quarterly)" },
+      { "sam": "svc-backup", "display_name": "Backup Service", "upn": "svc-backup@acme.corp", "groups": ["Backup Operators"],
+        "description": "Veeam service account. Do not disable." },
+      { "sam": "svc-web", "display_name": "Web Service", "upn": "svc-web@acme.corp", "groups": ["Domain Users"] }
+    ]
+  },
+  "hosts": [
+    {
+      "id": "dc01", "hostname": "DC01", "ip": "10.20.0.10", "os": "windows_server_2022",
+      "tags": ["domain-controller", "crown-jewel"],
+      "services": [
+        { "type": "dns", "port": 53, "zone": "acme.corp", "autofill_hosts": true,
+          "records": [
+            { "name": "_ldap._tcp.dc._msdcs", "type": "SRV", "value": "0 100 389 dc01.acme.corp" },
+            { "name": "_ldap._tcp", "type": "SRV", "value": "0 100 389 dc01.acme.corp" },
+            { "name": "_kerberos._tcp", "type": "SRV", "value": "0 100 88 dc01.acme.corp" },
+            { "name": "_gc._tcp", "type": "SRV", "value": "0 100 3268 dc01.acme.corp" },
+            { "name": "acme.corp", "type": "MX", "value": "10 mail01.acme.corp" },
+            { "name": "acme.corp", "type": "TXT", "value": "v=spf1 mx include:_spf.acme.corp -all" }
+          ] },
+        { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
+        { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
+        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 464, "protocol": "kpasswd5", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3268, "protocol": "ldap", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "dc02", "hostname": "DC02", "ip": "10.20.0.11", "os": "windows_server_2022",
+      "tags": ["domain-controller"],
+      "services": [
+        { "type": "banner", "port": 53, "protocol": "domain", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
+        { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
+        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "fs01", "hostname": "FS01", "ip": "10.20.0.20", "os": "windows_server_2019",
+      "tags": ["file-server"],
+      "services": [
+        { "type": "smb", "port": 445, "server_os": "Windows Server 2019 Standard 17763",
+          "shares": [
+            { "name": "Public", "comment": "Company-wide", "readonly": false,
+              "files": { "welcome.txt": "Welcome to ACME. See IT for access requests.\n" } },
+            { "name": "Finance", "comment": "Finance dept (restricted)", "readonly": true,
+              "files": { "2025/Q1-forecast.xlsx.txt": "PLACEHOLDER spreadsheet\n" } },
+            { "name": "HR", "comment": "HR dept (restricted)", "readonly": true,
+              "files": { "salaries-2025.csv.txt": "name,salary\nA.Jones,54000\n" } },
+            { "name": "IT", "comment": "IT dept", "readonly": true,
+              "files": {
+                "runbooks/backup.md": "Nightly Veeam job runs as svc-backup.\n",
+                "credentials/vault-export.txt": "sql: svc-sql / Summ3r2025!\nesx-root: R00tPa$$\n"
+              } }
+          ] },
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "web01", "hostname": "WEB01", "ip": "10.20.0.30", "os": "ubuntu_22_04",
+      "tags": ["dmz", "web"],
+      "services": [
+        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
+        { "type": "http", "port": 80, "server_header": "nginx/1.18.0 (Ubuntu)",
+          "extra_headers": { "X-Powered-By": "PHP/8.1.2" },
+          "default_status": 404,
+          "default_body": "<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.18.0 (Ubuntu)</center></body></html>",
+          "paths": {
+            "/": { "body": "<html><head><title>ACME Intranet</title></head><body><h1>ACME Intranet</h1><p>Please <a href=\"/login\">sign in</a>.</p></body></html>" },
+            "/login": { "body": "<html><body><h1>Sign in</h1><form method=post><input name=user><input name=pass type=password></form></body></html>" },
+            "/robots.txt": { "content_type": "text/plain; charset=utf-8", "body": "User-agent: *\nDisallow: /admin\nDisallow: /backup\nDisallow: /api\n" },
+            "/admin": { "status": 401, "headers": { "WWW-Authenticate": "Basic realm=\"ACME Admin\"" }, "body": "<h1>401 Unauthorized</h1>" },
+            "/backup/db.config": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-db-config",
+              "body": "<connectionStrings>\n  <add name=\"acme\" connectionString=\"Server=app01;Database=acme;User Id=svc-sql;Password=Summ3r2025!;\" />\n</connectionStrings>\n" },
+            "/.git/HEAD": { "content_type": "text/plain; charset=utf-8", "vuln_id": "exposed-git-dir", "body": "ref: refs/heads/main\n" }
+          } },
+        { "type": "banner", "port": 443, "protocol": "https", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "app01", "hostname": "APP01", "ip": "10.20.0.31", "os": "debian_12",
+      "tags": ["app", "database"],
+      "services": [
+        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2" },
+        { "type": "http", "port": 8080, "server_header": "Werkzeug/2.3.7 Python/3.11.2",
+          "paths": {
+            "/": { "content_type": "application/json", "body": "{\"service\":\"acme-api\",\"version\":\"1.4.2\"}" },
+            "/health": { "content_type": "application/json", "body": "{\"status\":\"ok\"}" },
+            "/api/v1/users": { "status": 403, "content_type": "application/json", "body": "{\"error\":\"forbidden\"}" }
+          } },
+        { "type": "banner", "port": 3306, "protocol": "mysql", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 6379, "protocol": "redis", "banner": "",
+          "rules": [ { "match": "PING", "respond": "+PONG", "close_after": false },
+                     { "match": "INFO", "respond": "-NOAUTH Authentication required.", "close_after": true } ] }
+      ]
+    },
+    {
+      "id": "mail01", "hostname": "MAIL01", "ip": "10.20.0.40", "os": "ubuntu_22_04",
+      "tags": ["mail"],
+      "services": [
+        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" },
+        { "type": "banner", "port": 25, "protocol": "smtp", "banner": "220 mail01.acme.corp ESMTP Postfix (Ubuntu)",
+          "rules": [ { "match": "^EHLO", "respond": "250-mail01.acme.corp\r\n250 STARTTLS" },
+                     { "match": "^QUIT", "respond": "221 Bye", "close_after": true } ] },
+        { "type": "banner", "port": 143, "protocol": "imap", "banner": "* OK [CAPABILITY IMAP4rev1 STARTTLS] Dovecot ready." },
+        { "type": "http", "port": 80, "server_header": "nginx/1.18.0 (Ubuntu)",
+          "paths": { "/": { "body": "<html><body><h1>ACME Webmail</h1><p><a href=\"/roundcube/\">Roundcube</a></p></body></html>" } } }
+      ]
+    },
+    {
+      "id": "ws01", "hostname": "WS01", "ip": "10.20.0.101", "os": "windows_11",
+      "tags": ["workstation"],
+      "services": [
+        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "ws02", "hostname": "WS02", "ip": "10.20.0.102", "os": "windows_10",
+      "tags": ["workstation"],
+      "services": [
+        { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+      ]
+    },
+    {
+      "id": "jump01", "hostname": "JUMP01", "ip": "10.20.0.50", "os": "ubuntu_22_04",
+      "tags": ["bastion"],
+      "services": [
+        { "type": "banner", "port": 22, "protocol": "ssh", "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6" }
+      ]
+    }
+  ],
+  "objectives": [
+    { "id": "obj-svc-sql-cred", "title": "Recover the svc-sql credential",
+      "description": "The svc-sql password is exposed in multiple places (LDAP description, an exposed web config, and an IT share).",
+      "hints": ["Anonymous LDAP", "Web content under /backup", "SMB IT share"] },
+    { "id": "obj-hr-data", "title": "Access HR data",
+      "description": "The HR share on FS01 exposes salary data over a null session." }
+  ]
+}
