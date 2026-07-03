@@ -55,7 +55,8 @@ rangefinder down -o build/                   # docker compose down
 ## Run a range
 
 ```bash
-docker build -t rangefinder:latest .
+docker build -t rangefinder:latest .                            # facade runtime image
+docker build -t rangefinder-attacker:latest docker/attacker     # attacker toolbox (nmap, curl, ldap-utils, dnsutils)
 rangefinder gen examples/corp.json -o build/
 docker compose -f build/docker-compose.yml up -d
 ```
