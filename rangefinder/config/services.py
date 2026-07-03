@@ -64,21 +64,36 @@ class HttpConfig(ServiceBase):
 
 
 class BannerRule(BaseModel):
-    """A line-oriented request/response rule applied after the banner is sent."""
+    """A request/response rule applied after the banner is sent.
+
+    Text mode matches ``match`` (regex) against each received line and replies with
+    ``respond``. Binary mode (see ``BannerConfig.binary``) matches ``match_hex`` (hex
+    bytes, substring) against the raw bytes read and replies with ``respond_hex``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    match: str  # regex tested against each received line
-    respond: str
-    raw: bool = False  # if False, the terminator is appended to the response
+    match: str = ""  # regex tested against each received line (text mode)
+    respond: str = ""
+    match_hex: str | None = None  # hex bytes to look for in the raw read (binary mode)
+    respond_hex: str | None = None  # hex bytes to send in reply (binary mode)
+    raw: bool = False  # text mode: if False, the terminator is appended to the response
     close_after: bool = False
 
 
 class BannerConfig(ServiceBase):
-    """Generic server-speaks-first TCP facade (SSH/FTP/SMTP-style version detection)."""
+    """Generic server-speaks-first TCP facade (SSH/FTP/SMTP-style version detection).
+
+    Set ``banner_hex`` to send a raw binary greeting (e.g. a MySQL server handshake) and
+    ``binary: true`` to switch the read loop to raw bytes + hex rules (e.g. answering an
+    RDP X.224 Connection Request), so nmap ``-sV`` can fingerprint protocols a text banner
+    cannot represent.
+    """
 
     type: Literal["banner"] = "banner"
-    banner: str
+    banner: str = ""
+    banner_hex: str | None = None  # raw binary greeting sent on connect (overrides banner)
+    binary: bool = False  # read raw bytes and match hex rules instead of lines
     terminator: str = "\r\n"
     banner_delay_ms: int = Field(default=0, ge=0)
     rules: list[BannerRule] = Field(default_factory=list)

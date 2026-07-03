@@ -1,10 +1,10 @@
 """Generic server-speaks-first TCP banner facade.
 
-Answers nmap ``-sV`` and manual probes for line-oriented protocols (SSH/FTP/SMTP/POP3).
-It sends a configurable banner immediately on connect with the exact terminator, then
-optionally replies to lines matching configured regex rules. It intentionally does NOT
-implement any real handshake (SSH KEX, FTP auth, etc.) — it is a version-detection decoy
-only, and everything it sees is logged.
+Answers nmap ``-sV`` and manual probes for line-oriented protocols (SSH/FTP/SMTP/POP3)
+via a text banner + regex rules, and for binary protocols (MySQL greeting, RDP X.224
+negotiation) via a raw banner + hex rules. It intentionally does NOT implement any real
+handshake past the greeting/probe response — it is a version-detection decoy only, and
+everything it sees is logged.
 """
 
 from __future__ import annotations
@@ -32,10 +32,17 @@ class BannerFacade(Facade):
         )
         self.cfg = cfg
         # Compile once; instance is shared across connections (read-only after init).
-        self._rules = [
-            (re.compile(rule.match.encode("latin-1")), rule) for rule in cfg.rules
+        self._text_rules = [
+            (re.compile(rule.match.encode("latin-1")), rule)
+            for rule in cfg.rules
+            if not cfg.binary and rule.match
         ]
-        self._banner_bytes = (cfg.banner + cfg.terminator).encode("latin-1")
+        self._hex_rules = [
+            (bytes.fromhex(rule.match_hex), rule)
+            for rule in cfg.rules
+            if cfg.binary and rule.match_hex
+        ]
+        self._banner_bytes = _greeting_bytes(cfg)
 
     @classmethod
     def from_config(cls, cfg: BannerConfig, ctx: FacadeContext) -> "BannerFacade":
@@ -45,13 +52,21 @@ class BannerFacade(Facade):
         if self.cfg.banner_delay_ms:
             await asyncio.sleep(self.cfg.banner_delay_ms / 1000)
 
-        writer.write(self._banner_bytes)
-        await writer.drain()
-        scope.emit(ev.banner_sent(scope, self.cfg.banner))
+        if self._banner_bytes:
+            writer.write(self._banner_bytes)
+            await writer.drain()
+            scope.emit(ev.banner_sent(scope, self.cfg.banner or self.cfg.banner_hex or ""))
 
         if self.cfg.close_after_banner:
             return
 
+        if self.cfg.binary:
+            await self._serve_binary(scope, reader, writer)
+        else:
+            await self._serve_text(scope, reader, writer)
+
+    async def _serve_text(self, scope, reader, writer):
+        term = self.cfg.terminator.encode("latin-1")
         while True:
             try:
                 line = await asyncio.wait_for(
@@ -65,24 +80,65 @@ class BannerFacade(Facade):
             matched_rule = None
             response: bytes | None = None
             close_after = False
-            for pattern, rule in self._rules:
+            for pattern, rule in self._text_rules:
                 if pattern.search(line):
                     matched_rule = rule.match
                     out = rule.respond.encode("latin-1")
-                    response = out if rule.raw else out + self.cfg.terminator.encode(
-                        "latin-1"
-                    )
+                    response = out if rule.raw else out + term
                     close_after = rule.close_after
                     break
 
-            scope.emit(ev.line_received(scope, _preview(line), matched_rule))
-
+            scope.emit(ev.line_received(scope, _text_preview(line), matched_rule))
             if response is not None:
                 writer.write(response)
                 await writer.drain()
             if close_after:
                 return
 
+    async def _serve_binary(self, scope, reader, writer):
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.cfg.idle_timeout_s
+                )
+            except (asyncio.TimeoutError, ValueError):
+                return
+            if not data:
+                return
 
-def _preview(line: bytes) -> str:
+            matched_rule = None
+            response: bytes | None = None
+            close_after = False
+            for needle, rule in self._hex_rules:
+                if needle in data:
+                    matched_rule = rule.match_hex
+                    response = bytes.fromhex(rule.respond_hex) if rule.respond_hex else None
+                    close_after = rule.close_after
+                    break
+
+            scope.emit(ev.line_received(scope, _hex_preview(data), matched_rule))
+            if response:
+                writer.write(response)
+                await writer.drain()
+            # Close promptly unless a matched rule explicitly keeps the connection open;
+            # holding unmatched probes open stalls scanners like nmap --version-all.
+            if close_after or matched_rule is None:
+                return
+
+
+def _greeting_bytes(cfg: BannerConfig) -> bytes:
+    if cfg.banner_hex:
+        return bytes.fromhex(cfg.banner_hex)
+    # Text mode: an empty banner still sends the terminator so probe-first scanners see a
+    # response (avoids nmap "tcpwrapped"); binary mode sends nothing unless banner_hex set.
+    if cfg.binary:
+        return b""
+    return (cfg.banner + cfg.terminator).encode("latin-1")
+
+
+def _text_preview(line: bytes) -> str:
     return line[:_PREVIEW_BYTES].decode("latin-1", "replace").rstrip("\r\n")
+
+
+def _hex_preview(data: bytes) -> str:
+    return data[:32].hex()

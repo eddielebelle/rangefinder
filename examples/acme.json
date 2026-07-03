@@ -46,7 +46,8 @@
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 464, "protocol": "kpasswd5", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3268, "protocol": "ldap", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
+          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
     },
     {
@@ -57,7 +58,8 @@
         { "type": "banner", "port": 88, "protocol": "kerberos-sec", "banner": "", "close_after_banner": true },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
+          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
     },
     {
@@ -78,7 +80,8 @@
                 "credentials/vault-export.txt": "sql: svc-sql / Summ3r2025!\nesx-root: R00tPa$$\n"
               } }
           ] },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
+          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
     },
     {
@@ -117,7 +120,8 @@
             "/health": { "content_type": "application/json", "body": "{\"status\":\"ok\"}" },
             "/api/v1/users": { "status": 403, "content_type": "application/json", "body": "{\"error\":\"forbidden\"}" }
           } },
-        { "type": "banner", "port": 3306, "protocol": "mysql", "banner": "", "close_after_banner": true },
+        { "type": "banner", "port": 3306, "protocol": "mysql",
+          "banner_hex": "5a0000000a382e302e33352d307562756e7475302e32322e30342e310036000000010203040506070800fff7210200ff811500000000000000000000090a0b0c0d0e0f10111213006d7973716c5f6e61746976655f70617373776f726400" },
         { "type": "banner", "port": 6379, "protocol": "redis", "banner": "",
           "rules": [ { "match": "PING", "respond": "+PONG", "close_after": false },
                      { "match": "INFO", "respond": "-NOAUTH Authentication required.", "close_after": true } ] }
@@ -141,7 +145,8 @@
       "tags": ["workstation"],
       "services": [
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
+          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
     },
     {
@@ -149,7 +154,8 @@
       "tags": ["workstation"],
       "services": [
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "banner": "", "close_after_banner": true }
+        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
+          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
       ]
     },
     {

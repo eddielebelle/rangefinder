@@ -35,6 +35,28 @@ def test_rule_response():
     assert "line_received" in actions(sink)
 
 
+def test_binary_greeting_sent_on_connect():
+    # MySQL-style: raw binary greeting sent immediately on connect.
+    facade, sink = _facade(
+        protocol="mysql", binary=True, banner_hex="0a382e302e3335", close_after_banner=True
+    )
+    data = asyncio.run(serve_and_exchange(facade, b""))
+    assert data == bytes.fromhex("0a382e302e3335")
+    assert "banner_sent" in actions(sink)
+
+
+def test_binary_rule_responds_to_probe():
+    # RDP-style: no greeting; respond to a client probe matched by hex.
+    facade, sink = _facade(
+        protocol="ms-wbt-server",
+        binary=True,
+        rules=[BannerRule(match_hex="0300", respond_hex="030000130ed0", close_after=True)],
+    )
+    data = asyncio.run(serve_and_exchange(facade, bytes.fromhex("030000130ee0")))
+    assert data == bytes.fromhex("030000130ed0")
+    assert "line_received" in actions(sink)
+
+
 def test_empty_banner_decoy_just_opens_port():
     # Represents an ldap/smb decoy: port open, no banner, closes immediately.
     facade, sink = _facade(protocol="ldap", banner="", close_after_banner=True)
