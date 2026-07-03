@@ -16,6 +16,14 @@ from pydantic import (
 from rangefinder.config.services import BuiltinService
 
 
+# Config-schema compatibility version. Bump this whenever the config schema changes in a
+# way an older runtime can't parse (a new facade type, a new service field, etc.).
+# Machine-generated configs (capture/import) stamp it; the loader refuses a config stamped
+# newer than the runtime supports, turning "stale image" into a clear, actionable error
+# instead of a cryptic field-rejection deep inside a container.
+SCHEMA_VERSION = 1
+
+
 class OS(str, Enum):
     windows_server_2019 = "windows_server_2019"
     windows_server_2022 = "windows_server_2022"
@@ -133,6 +141,9 @@ class RangeConfig(BaseModel):
 
     # name is usable as a docker-compose project name.
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_\-]{0,61}$")
+    # Config-schema version this config was generated for (see SCHEMA_VERSION). Optional:
+    # hand-authored configs may omit it. The loader checks it before validation.
+    schema_version: int | None = None
     network: Network
     hosts: list[Host] = Field(min_length=1)
     identities: Identities | None = None

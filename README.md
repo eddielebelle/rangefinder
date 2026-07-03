@@ -74,6 +74,12 @@ rangefinder gen examples/corp.json -o build/
 docker compose -f build/docker-compose.yml up -d
 ```
 
+> **Rebuild the image after upgrading.** Generated configs (capture/import) are stamped
+> with a config-schema version; if you deploy one against a stale runtime image that
+> predates a schema change, the container fails fast with a clear "rebuild the image"
+> error instead of silently. Run `docker build -t rangefinder:latest .` after pulling
+> changes.
+
 Each host container serves all of its facades on their real ports (80, 22, 445, …) at the
 host's static IP. Attach an attacker to the same network to test:
 

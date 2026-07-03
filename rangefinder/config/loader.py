@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rangefinder.config.model import RangeConfig
+from rangefinder.config.model import SCHEMA_VERSION, RangeConfig
 
 
 class ConfigError(Exception):
@@ -38,6 +38,16 @@ def load_config(path: str | Path) -> RangeConfig:
         raise ConfigError(f"{p}: top-level config must be a JSON object")
 
     data.pop("$schema", None)
+
+    # Check the schema stamp before validation so a config newer than this build produces a
+    # clear "rebuild the image" error rather than a cryptic unknown-field rejection.
+    stamped = data.get("schema_version")
+    if isinstance(stamped, int) and stamped > SCHEMA_VERSION:
+        raise ConfigError(
+            f"{p}: config needs config-schema v{stamped}, but this rangefinder build only "
+            f"supports up to v{SCHEMA_VERSION}. The runtime image is likely stale — rebuild "
+            f"it (docker build -t rangefinder:latest .) or upgrade rangefinder."
+        )
 
     try:
         return RangeConfig.model_validate(data)

@@ -237,10 +237,13 @@ def _capture_config(service, hostname, args, warnings, default_id) -> dict:
         subnet = "10.99.0.0/24"
         warnings.append(f"target is a hostname; assigned placeholder IP {ip} (edit as needed)")
 
+    from rangefinder.config.model import SCHEMA_VERSION
+
     host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.split(".")[0].lower()).strip("-") or default_id)
     name = re.sub(r"[^a-z0-9_-]", "-", (args.name or hostname).lower()).strip("-_") or "captured"
     return {
         "name": name[:62],
+        "schema_version": SCHEMA_VERSION,
         "network": {"subnet": subnet},
         "hosts": [{"id": host_id[:63], "hostname": hostname, "ip": ip,
                    "os": "generic_linux", "services": [service]}],

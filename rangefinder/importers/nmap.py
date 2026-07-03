@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from rangefinder.config.model import RangeConfig
+from rangefinder.config.model import SCHEMA_VERSION, RangeConfig
 
 _HTTP_PORTS = {80, 8080, 8000, 8888}
 _TLS_HTTP_PORTS = {443, 8443}
@@ -76,6 +76,7 @@ def import_nmap(
     net = _subnet(subnet, [h["ip"] for h in hosts], warnings)
     config = {
         "name": _sanitize_name(name),
+        "schema_version": SCHEMA_VERSION,
         "network": {"subnet": str(net)},
         "hosts": hosts,
     }
