@@ -263,6 +263,35 @@ def ldap_search(
     return _prune(ev)
 
 
+def dns_query(
+    facade: Any,
+    *,
+    src_ip: str | None,
+    src_port: int | None,
+    transport: str,
+    qname: str,
+    qtype: str,
+    rcode: str,
+    answers: int,
+) -> dict:
+    ev = _envelope(
+        facade,
+        action="dns_query",
+        category=["network"],
+        etype=["access"],
+        outcome="success" if rcode == "NOERROR" else "unknown",
+        src_ip=src_ip,
+        src_port=src_port,
+    )
+    ev["network"]["transport"] = transport
+    ev["dns"] = {
+        "question": {"name": qname, "type": qtype},
+        "response_code": rcode,
+        "answers_count": answers,
+    }
+    return _prune(ev)
+
+
 def smb_event(
     facade: Any,
     action: str,

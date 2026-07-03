@@ -136,6 +136,7 @@ def cmd_run(args) -> int:
         emitter=emitter,
         config_dir=str(Path(args.config).resolve().parent),
         identities=cfg.identities,
+        hosts=tuple((h.hostname, str(h.ip)) for h in cfg.hosts),
     )
 
     try:

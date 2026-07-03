@@ -29,11 +29,17 @@
       "tags": ["domain-controller", "crown-jewel"],
       "services": [
         {
-          "type": "banner",
+          "type": "dns",
           "port": 53,
-          "protocol": "domain",
-          "banner": "",
-          "close_after_banner": true
+          "zone": "corp.local",
+          "autofill_hosts": true,
+          "records": [
+            { "name": "_ldap._tcp.dc._msdcs", "type": "SRV", "value": "0 100 389 dc01.corp.local" },
+            { "name": "_ldap._tcp", "type": "SRV", "value": "0 100 389 dc01.corp.local" },
+            { "name": "_kerberos._tcp", "type": "SRV", "value": "0 100 88 dc01.corp.local" },
+            { "name": "corp.local", "type": "MX", "value": "10 mail.corp.local" },
+            { "name": "corp.local", "type": "TXT", "value": "v=spf1 mx -all" }
+          ]
         },
         {
           "type": "ldap",

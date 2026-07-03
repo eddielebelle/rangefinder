@@ -31,8 +31,7 @@ A range config has four parts:
 - **network** — the subnet the range lives on.
 - **hosts** — each becomes one container with a static IP; each host has **services**.
 - **services** — a typed, discriminated list. Each `type` maps to a facade. Implemented:
-  `http`, `banner`, `ldap`, `smb`. `dns` is defined in the schema but its facade arrives
-  later (represent that port as a `banner` decoy for now).
+  `http`, `banner`, `ldap`, `smb`, `dns`.
 - **identities** / **objectives** — AD users/groups and scenario objectives. Descriptive
   metadata in v1 (the LDAP facade will render `identities` in v2).
 
@@ -44,7 +43,7 @@ A range config has four parts:
 | `banner` | generic TCP banner | server-speaks-first banner for nmap `-sV`; optional line-regex rules. `ssh`/`ftp`/`smtp` are just banner presets |
 | `ldap` | LDAPv3 directory | real BER wire protocol; renders `identities` into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. Enumeration-grade (no cred validation / SASL / writes) |
 | `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files, so `smbclient -L` / `enum4linux` list shares and read planted files; captures NTLM auth attempts. `readonly` is advisory |
-| `dns` | *(planned)* | config model exists; use a `banner` decoy until the facade ships |
+| `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |
 
 ## CLI
 
@@ -77,6 +76,7 @@ curl -i http://10.13.37.20/
 dirb http://10.13.37.20/
 ldapsearch -x -H ldap://10.13.37.10 -b "DC=corp,DC=local" -s sub "(objectClass=user)"
 smbclient -N -L //10.13.37.10          # list shares; then //10.13.37.10/BACKUPS to browse
+dig @10.13.37.10 _ldap._tcp.dc._msdcs.corp.local SRV   # locate the "DC"
 ```
 
 Alternative: expose ports to host loopback instead of using an attacker container. This

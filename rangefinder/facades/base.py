@@ -41,6 +41,9 @@ class FacadeContext:
     # Range-level AD identities, rendered by the LDAP facade. None when the range has no
     # identities block (facades that don't need it ignore this).
     identities: "Identities | None" = None
+    # (hostname, ip) for every host in the range, used by the DNS facade to autofill A
+    # records for the zone.
+    hosts: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
