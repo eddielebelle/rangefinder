@@ -15,7 +15,8 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 For the *why* — the problem it targets, the two-plane architecture, how fidelity is verified, the
 endpoint/EDR seam, and where it fits an agentic security stack — see **[DESIGN.md](DESIGN.md)**.
 For a real end-to-end run (deploy → attack → score → verify, with captured output), see the
-**[walkthrough](docs/walkthrough.md)**.
+**[walkthrough](docs/walkthrough.md)**; for turning an attack into ground-truth-validated SIEM
+rules with a blue-team agent, see **[detection](docs/detection.md)**.
 
 > **Scope of realism (read this).** rangefinder is *enumeration / version-detection*
 > grade. The `kerberos` facade issues real, crackable AS-REP-roast and Kerberoast (TGS)
