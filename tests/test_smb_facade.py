@@ -313,6 +313,33 @@ def test_311_salt_is_fresh_per_negotiate():
     assert salt_a != salt_b and len(salt_a) == 32
 
 
+def test_backing_file_mtimes_backdated_and_varied(tmp_path):
+    """Backing files must not all share the container-boot timestamp — that reads as an estate
+    provisioned moments ago. Each file gets a distinct, backdated mtime; dirs are backdated too."""
+    import os
+    import time
+    from dataclasses import replace
+
+    ctx, _ = make_ctx()
+    ctx = replace(ctx, host_name="FS01")
+    cfg = SmbConfig(port=_free_port(), shares=[SmbShare(name="HR", files={
+        "salaries-2025.csv": "a,b", "policies/leave.txt": "x", "readme.txt": "y"})])
+    facade = SmbFacade.from_config(cfg, ctx)
+    facade._root = str(tmp_path)
+    share_dir = facade._materialize(cfg.shares[0])
+
+    now = time.time()
+    file_mtimes = []
+    for root, _, files in os.walk(share_dir):
+        for f in files:
+            file_mtimes.append(os.stat(os.path.join(root, f)).st_mtime)
+    assert len(file_mtimes) == 3
+    for m in file_mtimes:
+        assert 86400 < (now - m) < 3 * 365 * 86400 + 86400   # 1 day .. ~3 years old
+    assert len({round(m) for m in file_mtimes}) == 3          # all distinct (not one boot stamp)
+    assert (now - os.stat(share_dir).st_mtime) > 86400        # directory backdated as well
+
+
 def test_select_dialect_ignores_negotiate_context_noise():
     """A 3.1.1 request trails negotiate-context bytes after the dialect array; parsing must
     honour DialectCount so those bytes aren't misread as bogus dialects (and picked)."""

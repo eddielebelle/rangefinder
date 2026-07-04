@@ -111,6 +111,20 @@ def _server_identity(host_name: str) -> tuple[bytes, int]:
     return guid, uptime
 
 
+# A real file server's files carry mtimes spread across months/years. impacket serves each
+# backing file's real filesystem mtime, so writing them all at container start leaves every
+# file (and directory) stamped with one identical timestamp — a glaring "this whole estate was
+# provisioned moments ago" tell. Spread each file across 7 days–3 years before now, hashed from
+# host + path so it's unique per file and stable per host.
+_MTIME_MIN = 7 * 86400
+_MTIME_SPAN = 3 * 365 * 86400 - _MTIME_MIN
+
+
+def _backdated_mtime(host_name: str, key: str) -> float:
+    h = int(hashlib.sha256(f"rangefinder-mtime:{host_name}:{key}".encode()).hexdigest(), 16)
+    return time.time() - (_MTIME_MIN + h % _MTIME_SPAN)
+
+
 def _select_dialect(smb2, recv_packet, is_smb1: bool, ceiling: int) -> int | None:
     """Highest dialect the client offered that we support and is <= ceiling, else None.
 
@@ -286,8 +300,21 @@ class SmbFacade(Facade):
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w", encoding="utf-8") as fh:
                 fh.write(content)
+            # Backdate the file (before chmod, while still owner-writable) so it doesn't read
+            # as freshly provisioned. Key on the logical share path, not the random temp root,
+            # so the age is stable per host across restarts.
+            mt = _backdated_mtime(self.ctx.host_name, f"{share.name}/{rel}")
+            os.utime(full, (mt, mt))
             if share.readonly:
                 os.chmod(full, 0o444)  # advisory only
+        # Directory mtimes: a real directory's mtime tracks its newest entry. Walk bottom-up
+        # so children are already stamped, then set each dir to its newest child (or its own
+        # backdated time when empty) — otherwise every dir keeps the "created just now" mtime.
+        for dirpath, dirnames, filenames in os.walk(share_dir, topdown=False):
+            children = [os.path.join(dirpath, n) for n in dirnames + filenames]
+            newest = (max(os.stat(c).st_mtime for c in children) if children
+                      else _backdated_mtime(self.ctx.host_name, os.path.relpath(dirpath, self._root)))
+            os.utime(dirpath, (newest, newest))
         return share_dir
 
     # ---- telemetry from impacket's log stream ------------------------------------
