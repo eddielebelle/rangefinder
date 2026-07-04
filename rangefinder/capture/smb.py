@@ -29,31 +29,46 @@ def capture_smb(
     password: str = "",
     domain: str = "",
     timeout: float = 5.0,
-    max_files: int = 500,
+    max_files: int = 2000,
+    max_files_per_share: int = 200,
+    shares: list[str] | None = None,
     max_file_size: int = 65_536,
     scrub: bool = False,
 ) -> tuple[dict, list[str]]:
-    """Enumerate shares/files and return (smb_service_config, warnings)."""
+    """Enumerate shares/files and return (smb_service_config, warnings).
+
+    The file budget is **per share** (``max_files_per_share``) so one large share (a media
+    library, say) can't starve the rest; ``max_files`` is an overall safety ceiling. ``shares``
+    restricts the capture to named shares (case-insensitive) — target the ones that matter and
+    skip media/photo shares that are all placeholders anyway.
+    """
     from impacket.smbconnection import SMBConnection
 
     warnings: list[str] = []
     scrubber = Scrubber() if scrub else None
+    want = {s.strip().lower() for s in shares} if shares else None
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)
         server_os = conn.getServerOS() or "Windows"
         shares_cfg: list[dict] = []
-        budget = _Budget(max_files)
+        overall = _Budget(max_files)
+        seen: set[str] = set()
 
         for share in conn.listShares():
             name = _cstr(share["shi1_netname"])
             comment = _cstr(share["shi1_remark"])
             if name.upper() in _SKIP_SHARES or name.endswith("$"):
                 continue
+            seen.add(name.lower())
+            if want is not None and name.lower() not in want:
+                continue
 
             files: dict[str, str] = {}
+            per_share = _Budget(max_files_per_share)
             try:
-                _walk(conn, name, "", files, budget, max_file_size, scrubber, warnings)
+                _walk(conn, name, "", files, _Pair(per_share, overall), max_file_size,
+                      scrubber, warnings)
             except Exception as exc:  # access denied / not a disk share
                 warnings.append(f"share {name!r}: not fully readable at this access level ({exc})")
 
@@ -61,9 +76,15 @@ def capture_smb(
             if files:
                 entry["files"] = files
             shares_cfg.append(entry)
-            if budget.exhausted():
-                warnings.append(f"file cap {max_files} reached; capture truncated")
+            if per_share.exhausted():
+                warnings.append(f"share {name!r}: truncated at {max_files_per_share} files")
+            if overall.exhausted():
+                warnings.append(f"overall file cap {max_files} reached; capture truncated")
                 break
+
+        if want:
+            for missing in sorted(want - seen):
+                warnings.append(f"requested share {missing!r} not found on {host}")
     finally:
         try:
             conn.close()
@@ -89,6 +110,24 @@ class _Budget:
 
     def exhausted(self) -> bool:
         return self.used >= self.limit
+
+
+class _Pair:
+    """Consume from a per-share and an overall budget together; both must have room."""
+
+    def __init__(self, per_share: _Budget, overall: _Budget):
+        self.per_share = per_share
+        self.overall = overall
+
+    def take(self) -> bool:
+        if self.per_share.exhausted() or self.overall.exhausted():
+            return False
+        self.per_share.take()
+        self.overall.take()
+        return True
+
+    def exhausted(self) -> bool:
+        return self.per_share.exhausted() or self.overall.exhausted()
 
 
 def _walk(conn, share, smb_dir, files, budget, max_size, scrubber, warnings) -> None:

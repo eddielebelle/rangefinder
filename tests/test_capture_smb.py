@@ -84,6 +84,42 @@ def test_captured_smb_replays(tmp_path):
     assert {"PUBLIC", "IT"} <= names
 
 
+def _capture_with(**kw):
+    ctx, _ = make_ctx()
+    port = _free_port()
+    facade = SmbFacade.from_config(_target_cfg(port), ctx)
+    facade.bind_host = "127.0.0.1"
+    facade.port = port
+
+    async def run():
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: capture_smb("127.0.0.1", port, **kw))
+        finally:
+            await facade.stop()
+
+    return asyncio.run(run())
+
+
+def test_share_filter_targets_named_shares():
+    service, warnings = _capture_with(shares=["IT", "does-not-exist"])
+    names = {s["name"].upper() for s in service["shares"]}
+    assert names == {"IT"}  # Public skipped; only IT captured
+    assert any("does-not-exist" in w and "not found" in w for w in warnings)
+
+
+def test_per_share_budget_does_not_starve_other_shares():
+    # IT has 2 files; a per-share cap of 1 truncates IT but must NOT starve Public.
+    service, warnings = _capture_with(max_files_per_share=1)
+    shares = {s["name"].upper(): s for s in service["shares"]}
+    assert "PUBLIC" in shares and "IT" in shares
+    assert len(shares["IT"].get("files", {})) == 1          # IT truncated to the per-share cap
+    assert len(shares["PUBLIC"].get("files", {})) == 1      # Public still captured (not starved)
+    assert any("IT" in w and "truncated" in w for w in warnings)
+
+
 def test_scrub_redacts_file_contents():
     service, _ = asyncio.run(_capture(scrub=True))
     it = next(s for s in service["shares"] if s["name"] == "IT")
