@@ -178,12 +178,23 @@ def _build_records(cfg: DnsConfig, zone: str, ctx: FacadeContext) -> dict[str, l
         for host in ctx.hosts:
             ip = str(host.ip)
             fqdn = _qualify(host.hostname, zone)
-            # Don't clobber an explicit A record for the same name.
+            is_v6 = ":" in ip
+            # Forward A/AAAA (don't clobber an explicit record for the same name).
             if not any(c == 1 for c, _, _ in records.get(fqdn.lower(), [])):
-                is_v6 = ":" in ip
                 add(fqdn, 28 if is_v6 else 1, ip, 300)
+            # Reverse PTR: without this, a resolver pointed at us falls back to whatever
+            # names the host environment reverse-maps range IPs to (e.g. docker's
+            # "<container>.<network>"), an obvious tell. A real DNS server owns its PTRs.
+            if not is_v6:
+                ptr = _ptr_name(ip)
+                if not any(c == 12 for c, _, _ in records.get(ptr, [])):
+                    add(ptr, 12, fqdn, 300)
 
     return records
+
+
+def _ptr_name(ipv4: str) -> str:
+    return ".".join(reversed(ipv4.split("."))) + ".in-addr.arpa"
 
 
 def _qualify(name: str, zone: str) -> str:
