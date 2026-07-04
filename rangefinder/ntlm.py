@@ -13,10 +13,14 @@ import struct
 import time
 
 
-def build_challenge(type1_bytes: bytes, server_name: str, domain_name: str):
+def build_challenge(type1_bytes: bytes, server_name: str, domain_name: str,
+                    version: bytes | None = None):
     """Given the client's NTLM Type1, return (type2_bytes, challenge8, negotiate, challenge).
 
     negotiate/challenge are the parsed impacket messages needed later to validate Type3.
+    ``version`` sets the 8-byte NTLM Version field (major/minor/build/revision); the default
+    b"\\xff"*8 placeholder is fine for SMB/LDAP/HTTP, but RDP's rdp-ntlm-info reads it as the
+    OS build, so the RDP facade passes a real one.
     """
     from impacket import ntlm
 
@@ -53,7 +57,7 @@ def build_challenge(type1_bytes: bytes, server_name: str, domain_name: str):
     chal["TargetInfoFields_max_len"] = len(av)
     chal["TargetInfoFields"] = av
     chal["TargetInfoFields_offset"] = 40 + 16 + len(dn)
-    chal["Version"] = b"\xff" * 8
+    chal["Version"] = version if version is not None else b"\xff" * 8
     chal["VersionLen"] = 8
     return chal.getData(), challenge8, neg, chal
 

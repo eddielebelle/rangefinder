@@ -11,6 +11,7 @@ from rangefinder.facades import dns as _dns  # noqa: F401
 from rangefinder.facades import smb as _smb  # noqa: F401
 from rangefinder.facades import kerberos as _kerberos  # noqa: F401
 from rangefinder.facades import ssh as _ssh  # noqa: F401
+from rangefinder.facades import rdp as _rdp  # noqa: F401
 
 __all__ = [
     "Facade",

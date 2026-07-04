@@ -56,8 +56,7 @@
           ] },
         { "type": "banner", "port": 464, "protocol": "kpasswd5", "banner": "", "close_after_banner": true },
         { "type": "banner", "port": 3268, "protocol": "ldap", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
-          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
+        { "type": "rdp", "port": 3389, "os_version": "10.0.20348" }
       ]
     },
     {
@@ -68,8 +67,7 @@
         { "type": "kerberos", "port": 88 },
         { "type": "ldap", "port": 389, "allow_anonymous_bind": true },
         { "type": "banner", "port": 445, "protocol": "microsoft-ds", "banner": "", "close_after_banner": true },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
-          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
+        { "type": "rdp", "port": 3389, "os_version": "10.0.20348" }
       ]
     },
     {
@@ -90,8 +88,7 @@
                 "credentials/vault-export.txt": "sql: svc-sql / Summ3r2025!\nesx-root: R00tPa$$\n"
               } }
           ] },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
-          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
+        { "type": "rdp", "port": 3389, "os_version": "10.0.17763" }
       ]
     },
     {
@@ -160,8 +157,7 @@
         { "type": "smb", "port": 445, "server_os": "Windows 11 Pro 22631",
           "shares": [ { "name": "Users", "comment": "", "readonly": true,
             "files": { "Public/Desktop/readme.txt": "This workstation is managed by ACME IT. Report issues to helpdesk@acme.corp.\n" } } ] },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
-          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
+        { "type": "rdp", "port": 3389, "os_version": "10.0.22631" }
       ]
     },
     {
@@ -171,8 +167,7 @@
         { "type": "smb", "port": 445, "server_os": "Windows 10 Pro 19045",
           "shares": [ { "name": "Users", "comment": "", "readonly": true,
             "files": { "Public/Desktop/readme.txt": "This workstation is managed by ACME IT. Report issues to helpdesk@acme.corp.\n" } } ] },
-        { "type": "banner", "port": 3389, "protocol": "ms-wbt-server", "binary": true,
-          "rules": [ { "match_hex": "0300", "respond_hex": "0300000b06d00000123400", "close_after": true } ] }
+        { "type": "rdp", "port": 3389, "os_version": "10.0.19045" }
       ]
     },
     {
