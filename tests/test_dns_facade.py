@@ -116,7 +116,10 @@ def test_udp_end_to_end():
             loop = asyncio.get_running_loop()
             client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             client.setblocking(False)
-            await loop.sock_sendto(client, _query("dc01.corp.local", 1), ("127.0.0.1", facade.port))
+            # UDP connect() is immediate (no handshake) and fixes the default peer, so we
+            # can use sock_sendall/sock_recv — which exist on 3.10, unlike sock_sendto.
+            client.connect(("127.0.0.1", facade.port))
+            await loop.sock_sendall(client, _query("dc01.corp.local", 1))
             data = await asyncio.wait_for(loop.sock_recv(client, 512), timeout=2)
             client.close()
         finally:
