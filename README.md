@@ -1,5 +1,9 @@
 # rangefinder
 
+[![CI](https://github.com/eddielebelle/rangefinder/actions/workflows/ci.yml/badge.svg)](https://github.com/eddielebelle/rangefinder/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 Declarative cyber-range generator for **authorized** security testing. Author a fake
 network as one JSON file; rangefinder renders it into lightweight protocol **facades**
 that answer real recon/enumeration tooling (nmap, curl, dirb/gobuster, ldapsearch) and
