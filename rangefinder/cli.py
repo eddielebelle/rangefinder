@@ -77,6 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_smb.add_argument("--username", default="", help="username (default: null session)")
     p_cap_smb.add_argument("--password", default="")
     p_cap_smb.add_argument("--domain", default="")
+    p_cap_smb.add_argument("--shares", default=None,
+                           help="comma-separated share names to capture (default: all readable)")
+    p_cap_smb.add_argument("--max-files-per-share", type=int, default=200,
+                           help="file budget per share so a big share can't starve the rest")
     p_cap_smb.add_argument("-o", "--out", type=Path, default=None)
     p_cap_smb.add_argument("--name", default=None, help="range name")
     p_cap_smb.add_argument("--host-id", default=None)
@@ -245,9 +249,11 @@ def cmd_capture(args) -> int:
 
         hostname = args.host
         try:
+            share_filter = [s for s in (args.shares or "").split(",") if s.strip()] or None
             service, warnings = capture_smb(
                 hostname, args.port, username=args.username,
                 password=args.password, domain=args.domain, scrub=args.scrub,
+                max_files_per_share=args.max_files_per_share, shares=share_filter,
             )
         except Exception as exc:  # impacket raises many exception types
             print(f"error: SMB capture failed: {exc}", file=sys.stderr)
