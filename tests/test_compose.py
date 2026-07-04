@@ -40,3 +40,21 @@ def test_no_attacker_flag():
     cfg = load_config(EXAMPLE)
     compose = build_compose(cfg, include_attacker=False)
     assert "attacker" not in compose["services"]
+
+
+def test_dns_and_mac_wiring():
+    cfg = load_config(EXAMPLE)
+    compose = build_compose(cfg)
+
+    dc = compose["services"]["dc01"]
+    # every container resolves against the range's DNS host (dc01), search = the AD domain,
+    # so reverse lookups and the search suffix don't leak docker's naming.
+    assert dc["dns"] == ["10.13.37.10"]
+    assert dc["dns_search"] == ["corp.local"]
+    assert compose["services"]["attacker"]["dns"] == ["10.13.37.10"]
+
+    # vendor-OUI (VMware) MACs, deterministic and distinct per host — not docker's random
+    # locally-administered ones.
+    assert dc["mac_address"].startswith("00:50:56:")
+    macs = [s["mac_address"] for k, s in compose["services"].items() if k != "attacker"]
+    assert len(set(macs)) == len(cfg.hosts)

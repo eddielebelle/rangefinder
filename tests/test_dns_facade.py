@@ -68,6 +68,21 @@ def test_autofill_a_record():
     assert any(e["event"]["action"] == "dns_query" for e in sink.events)
 
 
+def test_autofill_ptr_record():
+    """A resolver pointed at us must get real reverse names, not fall through to the host's
+    docker naming — so range host IPs autofill PTRs back to their FQDNs."""
+    facade, _ = _facade()
+    resp = facade.build_response(_query("20.37.13.10.in-addr.arpa", 12), "10.0.0.9", 5300, "udp")
+    _, off = _decode_name(resp, 12)
+    off += 4  # qtype + qclass
+    _, off = _decode_name(resp, off)  # answer owner name
+    rtype, _rclass, _ttl, _rdlen = struct.unpack("!HHIH", resp[off : off + 10])
+    off += 10
+    ptr_target, _ = _decode_name(resp, off)
+    assert rtype == 12
+    assert ptr_target == "web01.corp.local"
+
+
 def test_srv_record():
     facade, _ = _facade()
     resp = facade.build_response(_query("_ldap._tcp.dc._msdcs.corp.local", 33), "10.0.0.9", 5300, "udp")
