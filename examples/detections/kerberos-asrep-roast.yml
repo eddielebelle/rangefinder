@@ -1,0 +1,20 @@
+title: Kerberos AS-REP roasting
+status: experimental
+description: >
+  The KDC returned an AS-REP for an account that does not require Kerberos
+  pre-authentication. The reply contains an encrypted blob crackable offline to
+  recover the account's password (AS-REP roasting). Detects the roastable reply
+  itself, independent of the requesting host, so it generalises to any
+  pre-auth-disabled account.
+logsource:
+  product: rangefinder
+  service: kerberos
+detection:
+  selection:
+    event.action: kerberos_as_rep
+    rangefinder.kerberos.asrep_roastable: true
+  condition: selection
+level: high
+tags:
+  - attack.credential_access
+  - attack.t1558.004

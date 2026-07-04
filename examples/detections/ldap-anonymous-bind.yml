@@ -1,0 +1,20 @@
+title: Anonymous LDAP bind to a directory service
+status: experimental
+description: >
+  An LDAP session bound anonymously (null credentials) to the domain directory.
+  Anonymous binds allow unauthenticated enumeration of users, groups and
+  attributes and are a hallmark of Active Directory reconnaissance. Legitimate
+  directory clients authenticate. Detects the technique via the bind auth
+  method, independent of source address or search filter.
+logsource:
+  product: rangefinder
+  service: ldap
+detection:
+  selection:
+    event.action: ldap_bind
+    rangefinder.auth.method: anonymous
+  condition: selection
+level: medium
+tags:
+  - attack.discovery
+  - attack.t1087.002

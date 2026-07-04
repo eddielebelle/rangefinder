@@ -1,0 +1,24 @@
+title: Anonymous SMB access to a non-public share
+status: experimental
+description: >
+  A null-session (anonymous) SMB client mounted a share other than the
+  designated public/guest share. Legitimate anonymous access is limited to the
+  PUBLIC share; a null session reaching HR, IT, FINANCE, etc. is share
+  enumeration / unauthorised data access. Keys on the tree-connect target, not
+  on the attacker's address or the specific share names, so it generalises to
+  any non-public share reached without credentials.
+logsource:
+  product: rangefinder
+  service: smb
+detection:
+  selection:
+    event.action: smb_tree_connect
+  public_share:
+    rangefinder.smb.share:
+      - PUBLIC
+      - IPC$
+  condition: selection and not public_share
+level: high
+tags:
+  - attack.discovery
+  - attack.t1135
