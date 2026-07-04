@@ -8,6 +8,9 @@ just facades that respond convincingly enough to test against, and log everythin
 
 Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-teamers.
 
+For the *why* — the problem it targets, the two-plane architecture, how fidelity is verified, the
+endpoint/EDR seam, and where it fits an agentic security stack — see **[DESIGN.md](DESIGN.md)**.
+
 > **Scope of realism (read this).** rangefinder is *enumeration / version-detection*
 > grade. The `kerberos` facade issues real, crackable AS-REP-roast and Kerberoast (TGS)
 > tickets over RC4 (the roasting path attackers use), but it does **not** validate
