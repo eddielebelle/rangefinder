@@ -96,6 +96,17 @@ def main(argv: list[str] | None = None) -> int:
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
     p_score.add_argument("--json", action="store_true", help="emit results as JSON")
 
+    p_detect = sub.add_parser(
+        "detect", help="generate + validate SIEM (Sigma) detections from telemetry")
+    p_detect.add_argument("--attack", required=True,
+                          help="attack telemetry JSONL (labelled malicious), or - for stdin")
+    p_detect.add_argument("--benign", default=None,
+                          help="benign baseline telemetry JSONL (for false-positive scoring)")
+    p_detect.add_argument("--rule", type=Path, default=None,
+                          help="validate this Sigma rule file instead of generating templates")
+    p_detect.add_argument("-o", "--out", type=Path, default=None,
+                          help="write validated rules as .yml into this directory")
+
     p_run = sub.add_parser("run", help="serve a host's facades (container entrypoint)")
     p_run.add_argument("--host", required=True)
     p_run.add_argument("--config", required=True, type=Path)
@@ -143,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         "import": cmd_import,
         "capture": cmd_capture,
         "score": cmd_score,
+        "detect": cmd_detect,
         "verify": cmd_verify,
         "run": cmd_run,
         "up": cmd_up,
@@ -377,6 +389,54 @@ def cmd_score(args) -> int:
     print()
     print(f"Summary: {len(met)}/{len(scoreable)} objectives met")
     return EXIT_OK
+
+
+def cmd_detect(args) -> int:
+    import re
+
+    import yaml
+
+    from rangefinder import detect as det
+
+    def load(path: str | None) -> list[dict]:
+        if not path:
+            return []
+        text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+        return det.parse_events(text.splitlines())
+
+    attack = load(args.attack)
+    benign = load(args.benign)
+    if not attack:
+        print("no attack telemetry events found", file=sys.stderr)
+        return EXIT_CONFIG
+
+    if args.rule:
+        rules = [yaml.safe_load(args.rule.read_text(encoding="utf-8"))]
+    else:
+        rules = det.generate(attack)
+        if not rules:
+            print("no known techniques found in the attack telemetry", file=sys.stderr)
+            return EXIT_ERROR
+
+    print(f"Detections vs telemetry  (attack: {len(attack)} events, benign: {len(benign)} events)\n")
+    validated: list[dict] = []
+    for rule in rules:
+        v = det.validate(rule, attack, benign)
+        print(f"  [{'PASS' if v.ok else 'FAIL'}] {v.title}")
+        print(f"         TP {v.true_positives}/{v.attack_total}   "
+              f"FP {v.false_positives}/{v.benign_total}   -> {v.verdict}")
+        if v.ok:
+            validated.append(rule)
+    print(f"\n{len(validated)}/{len(rules)} rule(s) validated against ground truth.")
+
+    if args.out and validated:
+        args.out.mkdir(parents=True, exist_ok=True)
+        for rule in validated:
+            slug = re.sub(r"[^a-z0-9]+", "-", str(rule.get("title", "rule")).lower()).strip("-")
+            (args.out / f"{slug}.yml").write_text(
+                yaml.safe_dump(rule, sort_keys=False, allow_unicode=True))
+        print(f"wrote {len(validated)} rule(s) to {args.out}/")
+    return EXIT_OK if validated else EXIT_ERROR
 
 
 def cmd_verify(args) -> int:
