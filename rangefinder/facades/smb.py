@@ -18,12 +18,15 @@ hardened file server.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import shutil
+import struct
 import tempfile
 import threading
+import time
 import uuid
 
 from rangefinder.config.services import SmbConfig, SmbShare
@@ -35,6 +38,98 @@ from rangefinder.telemetry import event as ev
 # impacket.smbserver (child, propagates up) while NetrShareEnum is logged on "impacket"
 # itself, so only the root of the tree sees both.
 _LOGGER_NAME = "impacket"
+
+# SMB2 dialect wire values (stable protocol constants; hardcoded so the config layer never
+# imports impacket). impacket's SimpleSMBServer hardcodes the 2.0.2 negotiate ceiling, an
+# identical b'A'*16 ServerGuid on every host, and SystemTime == ServerStartTime (so the box
+# looks freshly booted at every negotiate) — all three are obvious emulation tells. The
+# negotiate realism hook below overwrites them per host.
+_DIALECTS = {"2.0.2": 0x0202, "2.1": 0x0210, "3.0": 0x0300, "3.1.1": 0x0311}
+_DIALECT_311 = 0x0311
+
+# SMB2 negotiate-context types + capability values (MS-SMB2 2.2.3.1 / 2.2.4). A 3.1.1
+# negotiate response MUST carry a preauth-integrity context or clients reject it; encryption
+# and signing contexts are what nmap's smb2-capabilities reads to report a modern service.
+_CTX_PREAUTH_INTEGRITY = 0x0001
+_CTX_ENCRYPTION = 0x0002
+_CTX_SIGNING = 0x0008
+_HASH_SHA512 = 0x0001
+_CIPHER_AES128_GCM = 0x0002
+_SIGNALG_AES_CMAC = 0x0001
+
+
+def _pack_negotiate_contexts() -> tuple[int, bytes]:
+    """Build the negotiate-context list for a 3.1.1 response -> (count, 8-byte-aligned bytes).
+
+    Advertises SHA-512 preauth integrity (mandatory, with a fresh 32-byte salt), AES-128-GCM
+    encryption, and AES-CMAC signing — the profile a modern Windows 3.1.1 server presents.
+    Each SMB2_NEGOTIATE_CONTEXT is ContextType(2) DataLength(2) Reserved(4) then Data, and
+    every context after the first starts on an 8-byte boundary relative to the list start.
+    """
+    preauth = struct.pack("<HHH", 1, 32, _HASH_SHA512) + os.urandom(32)
+    encryption = struct.pack("<HH", 1, _CIPHER_AES128_GCM)
+    signing = struct.pack("<HH", 1, _SIGNALG_AES_CMAC)
+    contexts = [
+        (_CTX_PREAUTH_INTEGRITY, preauth),
+        (_CTX_ENCRYPTION, encryption),
+        (_CTX_SIGNING, signing),
+    ]
+    out = bytearray()
+    for i, (ctype, data) in enumerate(contexts):
+        if i:
+            out += b"\x00" * ((8 - len(out) % 8) % 8)  # align each context start to 8 bytes
+        out += struct.pack("<HHL", ctype, len(data), 0) + data
+    return len(contexts), bytes(out)
+
+
+def _attach_negotiate_contexts(cmd) -> None:
+    """Populate a SMB2Negotiate_Response with a 3.1.1 negotiate-context list.
+
+    The context list begins on an 8-byte boundary after the security buffer; NegotiateContext
+    Offset is measured from the start of the SMB2 header (the security buffer sits at 0x80).
+    """
+    count, ctx_bytes = _pack_negotiate_contexts()
+    sec_end = int(cmd["SecurityBufferOffset"]) + int(cmd["SecurityBufferLength"])
+    neg_offset = (sec_end + 7) & ~7
+    cmd["NegotiateContextCount"] = count
+    cmd["NegotiateContextOffset"] = neg_offset
+    cmd["Padding"] = b"\x00" * (neg_offset - sec_end)
+    cmd["NegotiateContextList"] = ctx_bytes
+
+
+def _server_identity(host_name: str) -> tuple[bytes, int]:
+    """Return a stable per-host ``(server_guid_16b, uptime_offset_seconds)``.
+
+    Derived from the host name so it is unique per host yet identical across restarts of the
+    same host — exactly how a real machine's SMB ServerGUID behaves (it persists across
+    reboots). The uptime offset backdates the apparent boot time by 1h–45d so a container
+    that started seconds ago still reports a plausible multi-day uptime.
+    """
+    h = hashlib.sha256(("rangefinder-smb-guid:" + host_name).encode()).digest()
+    guid = h[:16]
+    uptime = 3600 + int.from_bytes(h[16:20], "big") % (45 * 86400)
+    return guid, uptime
+
+
+def _select_dialect(smb2, recv_packet, is_smb1: bool, ceiling: int) -> int | None:
+    """Highest dialect the client offered that we support and is <= ceiling, else None.
+
+    None means "leave impacket's default (2.0.2)": either an SMB1 negotiate (which only ever
+    reaches 2.0.2 in impacket) or a client whose offers don't intersect our ladder. Parsing
+    honours DialectCount so the negotiate-context bytes trailing a 3.1.1 request are not
+    misread as bogus dialects.
+    """
+    if is_smb1:
+        return None
+    try:
+        neg = smb2.SMB2Negotiate(recv_packet["Data"])
+        count = int(neg["DialectCount"])
+        offered = list(neg["Dialects"])[:count]
+    except Exception:
+        return None
+    supported = set(_DIALECTS.values())
+    candidates = [d for d in offered if d in supported and d <= ceiling]
+    return max(candidates) if candidates else None
 
 
 @register("smb")
@@ -50,6 +145,10 @@ class SmbFacade(Facade):
         self._root: str | None = None
         self._handler: logging.Handler | None = None
         self._stopped: asyncio.Future | None = None
+        # Per-host stable SMB identity; boot epoch is fixed once at start() so SystemTime
+        # advances while ServerStartTime stays put (real uptime), not "booted this instant".
+        self._server_guid, self._uptime_offset = _server_identity(ctx.host_name)
+        self._boot_epoch: float | None = None
 
     @classmethod
     def from_config(cls, cfg: SmbConfig, ctx: FacadeContext) -> "SmbFacade":
@@ -76,6 +175,8 @@ class SmbFacade(Facade):
         # nmap smb-os-discovery reads.
         inner._SMBSERVER__serverOS = self.cfg.server_os
         inner._SMBSERVER__serverName = self.ctx.host_name.upper()
+        self._boot_epoch = time.time() - self._uptime_offset
+        self._install_negotiate_realism(inner)
 
         for share in self.cfg.shares:
             path = self._materialize(share)
@@ -123,6 +224,53 @@ class SmbFacade(Facade):
             shutil.rmtree(self._root, ignore_errors=True)
         if self._stopped is not None and not self._stopped.done():
             self._stopped.set_result(None)
+
+    # ---- negotiate realism -------------------------------------------------------
+    def _install_negotiate_realism(self, inner) -> None:
+        """Hook SMB2_NEGOTIATE to fix impacket's hardcoded emulation tells.
+
+        Overwrites the response with (1) this host's stable ServerGuid, (2) a fixed past
+        ServerStartTime + live SystemTime, (3) the highest common dialect up to the configured
+        ceiling, and (4) — when 3.1.1 is negotiated — the mandatory preauth-integrity plus
+        encryption/signing negotiate contexts, so recon tooling sees a modern service. Wraps
+        rather than replaces the original handler so impacket's session-blob construction is
+        preserved.
+
+        Signing note: impacket's server signs with HMAC-SHA256 (the 2.x algorithm), so it
+        cannot honour the AES-CMAC signing a real 3.1.1 client would use. We therefore leave
+        SecurityMode at "enabled, not required" for 3.1.1 (a signed/credentialed session is a
+        deeper tier we don't implement); ``signing_required`` still applies to <=3.0.
+        """
+        from impacket import smb3structs as smb2
+        from impacket.smb import POSIXtoFT
+
+        original = inner.hookSmb2Command(smb2.SMB2_NEGOTIATE, None)
+        ceiling = _DIALECTS[self.cfg.max_dialect]
+        guid = self._server_guid
+
+        def _hook(conn_id, smb_server, recv_packet, is_smb1=False):
+            result = original(conn_id, smb_server, recv_packet, is_smb1)
+            try:
+                cmd = result[1][0]["Data"]
+                cmd["ServerGuid"] = guid
+                now = int(time.time())
+                cmd["SystemTime"] = POSIXtoFT(now)
+                cmd["ServerStartTime"] = POSIXtoFT(int(self._boot_epoch or now))
+                chosen = _select_dialect(smb2, recv_packet, is_smb1, ceiling)
+                if chosen is not None:
+                    cmd["DialectRevision"] = chosen
+                if chosen == _DIALECT_311:
+                    cmd["SecurityMode"] = 0x1  # ENABLED only (see signing note above)
+                    _attach_negotiate_contexts(cmd)
+                else:
+                    cmd["SecurityMode"] = 0x3 if self.cfg.signing_required else 0x1
+            except Exception:
+                # Never let a realism tweak break the handshake — fall back to impacket's
+                # (working, if less convincing) response.
+                pass
+            return result
+
+        inner.hookSmb2Command(smb2.SMB2_NEGOTIATE, _hook)
 
     # ---- backing files ----------------------------------------------------------
     def _materialize(self, share: SmbShare) -> str:

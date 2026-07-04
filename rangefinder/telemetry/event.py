@@ -405,6 +405,59 @@ def krb_event(
     return _prune(ev)
 
 
+def rdp_negotiate(
+    scope: Any,
+    *,
+    requested: list[str],
+    selected: str,
+    nla_required: bool,
+    cookie: str | None = None,
+) -> dict:
+    """RDP X.224 security negotiation: what the client requested vs what the server selected."""
+    ev = _envelope(
+        scope.facade,
+        action="rdp_negotiate",
+        category=["network"],
+        etype=["protocol", "connection"],
+        outcome="success",
+        src_ip=scope.src_ip,
+        src_port=scope.src_port,
+        conn_id=scope.conn_id,
+    )
+    ev["rangefinder"]["rdp"] = {
+        "requested_protocols": requested,
+        "selected_protocol": selected,
+        "nla_required": nla_required,
+        "cookie": cookie,
+    }
+    return _prune(ev)
+
+
+def rdp_auth(
+    scope: Any,
+    *,
+    action: str,
+    outcome: str,
+    kind: str = "event",
+    extra: dict | None = None,
+) -> dict:
+    """RDP CredSSP/NLA phase: NTLM negotiate seen, challenge issued, or a validated logon."""
+    ev = _envelope(
+        scope.facade,
+        action=action,
+        category=["authentication"],
+        etype=["start"],
+        kind=kind,
+        outcome=outcome,
+        src_ip=scope.src_ip,
+        src_port=scope.src_port,
+        conn_id=scope.conn_id,
+    )
+    if extra:
+        ev["rangefinder"].update(extra)
+    return _prune(ev)
+
+
 def smb_event(
     facade: Any,
     action: str,

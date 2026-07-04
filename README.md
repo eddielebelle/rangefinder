@@ -17,7 +17,11 @@ Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-t
 > complete **by design**. The **LDAP** facade speaks real
 > LDAPv3 for enumeration (anonymous bind + search; LDAPS via `tls: true`) but has no
 > SASL/StartTLS or writes. HTTP and LDAP serve over TLS with a self-signed cert (nmap
-> fingerprints it); other TLS ports (RDP, IMAPS, …) remain decoys for now. The
+> fingerprints it); other TLS ports (IMAPS, …) remain decoys for now. The **RDP** facade
+answers the X.224 security negotiation, upgrades to TLS with the host cert, and — when NLA
+is required — challenges over CredSSP so `rdp-ntlm-info` leaks the host's name/domain/OS
+build; it stops before the RDP graphics/MCS layer (an unauthenticated session is rejected,
+as on a hardened box). The
 > **SMB** facade (impacket-backed) serves the configured shares as real files and validates
 > NTLM against the `identities` NT hashes (pass-the-hash), while still allowing null-session
 > enumeration (`readonly` is advisory). The **SSH** facade
@@ -38,7 +42,7 @@ A range config has four parts:
 - **network** — the subnet the range lives on.
 - **hosts** — each becomes one container with a static IP; each host has **services**.
 - **services** — a typed, discriminated list. Each `type` maps to a facade. Implemented:
-  `http`, `banner`, `ssh`, `ldap`, `smb`, `dns`.
+  `http`, `banner`, `ssh`, `ldap`, `smb`, `dns`, `rdp`.
 - **identities** / **objectives** — AD users/groups (rendered by the LDAP facade) and
   scenario objectives (descriptive metadata).
 
@@ -51,8 +55,9 @@ A range config has four parts:
 | `ssh` | real SSH server | asyncssh-backed: genuine key exchange, so clients reach auth. Captures every password/public-key attempt as telemetry and rejects it; `accept_creds` lets a planted login succeed into a decoy shell that logs typed commands. `server_version` sets the OpenSSH banner nmap reads |
 | `kerberos` | KDC (roasting) | answers AS-REQ + TGS-REQ on 88 (UDP+TCP) with AES/RC4 pre-auth (advertises the salt via PA-ETYPE-INFO2). **AS-REP roasting**: a `no_preauth` account yields a real `$krb5asrep$` (GetNPUsers). **Kerberoasting**: an account with an `spn` yields a `$krb5tgs$` over the AS→TGS flow. Crackable tickets, logged as alerts. A roasting decoy, not a full KDC |
 | `ldap` | LDAPv3(S) directory | real BER wire protocol; renders `identities` (users/groups/SPNs) and the range's Windows hosts (computer objects + DC OU) into a DIT; anonymous bind + RootDSE + subtree search + and/or/not/equality/present/substrings filters. **Validates NTLM binds** (SASL GSS-SPNEGO + MS Sicily) against `identities` NT hashes. `tls: true` serves LDAPS |
-| `smb` | SMB2 file server | impacket-backed; renders `shares` as real backing files (`smbclient -L` / `enum4linux` enumerate them). **Validates NTLM** against `identities` NT hashes — pass-the-hash succeeds with the right hash, a wrong hash is rejected (failed logon → alert) — while null-session enumeration still works. `readonly` is advisory |
+| `smb` | SMB2/3 file server | impacket-backed; renders `shares` as real backing files (`smbclient -L` / `enum4linux` enumerate them). **Validates NTLM** against `identities` NT hashes — pass-the-hash succeeds with the right hash, a wrong hash is rejected (failed logon → alert) — while null-session enumeration still works. `readonly` is advisory. Negotiates up to **SMB 3.1.1** (`max_dialect`) with a per-host ServerGUID, real uptime, and 3.1.1 preauth-integrity/encryption/signing negotiate contexts; a signed/credentialed 3.1.1 session needs AES-CMAC the backend can't do, so signing is advertised-not-required at 3.1.1 |
 | `dns` | DNS server (UDP+TCP) | authoritative A/AAAA/CNAME/NS/PTR/MX/TXT/SRV from `records`, autofills A records for range hosts, serves the `_ldap._tcp` / `_kerberos._tcp` SRV records tools use to locate a DC. No recursion / AXFR / DNSSEC |
+| `rdp` | RDP (NLA) endpoint | answers the X.224 security negotiation, upgrades to TLS with the host cert, and (when `nla_required`) challenges over CredSSP so `rdp-enum-encryption` reports NLA-required and `rdp-ntlm-info` leaks NetBIOS/DNS name, domain and OS build (`os_version`). Captures the `mstshash` cookie + any CredSSP logon as telemetry. Stops before the RDP graphics/MCS layer |
 
 ## CLI
 

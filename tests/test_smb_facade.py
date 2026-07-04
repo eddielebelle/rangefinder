@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import struct
 
 from helpers import make_ctx
 
@@ -127,3 +128,206 @@ def test_pass_the_hash_validation():
                 for e in sink.events if e["event"]["action"] == "smb_auth"}
     assert ("svc-web", "success") in outcomes
     assert ("svc-web", "failure") in outcomes
+
+
+# --------------------------------------------------------------- negotiate realism
+
+def _raw_negotiate(port: int, dialects: list[int]):
+    """Send a real SMB2 NEGOTIATE offering ``dialects`` and return the parsed response.
+
+    Bypasses impacket's client (which defaults to an SMB1 negotiate that only reaches 2.0.2)
+    so we can inspect the server's dialect choice, ServerGuid and timestamps directly.
+    """
+    import struct
+
+    from impacket import smb3structs as smb2
+
+    pkt = smb2.SMB2Packet()
+    pkt["Command"] = smb2.SMB2_NEGOTIATE
+    neg = smb2.SMB2Negotiate()
+    neg["DialectCount"] = len(dialects)
+    neg["SecurityMode"] = 1
+    neg["Capabilities"] = 0
+    neg["ClientGuid"] = b"\x11" * 16
+    neg["Dialects"] = dialects
+    pkt["Data"] = neg
+    body = pkt.getData()
+
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(struct.pack(">I", len(body)) + body)
+        ln = struct.unpack(">I", s.recv(4))[0]
+        buf = b""
+        while len(buf) < ln:
+            buf += s.recv(ln - len(buf))
+    finally:
+        s.close()
+    resp_pkt = smb2.SMB2Packet(buf)
+    return smb2.SMB2Negotiate_Response(resp_pkt["Data"])
+
+
+def _serve(cfg, hostname="fs01"):
+    from dataclasses import replace
+
+    ctx, _ = make_ctx()
+    ctx = replace(ctx, host_name=hostname)
+    facade = SmbFacade.from_config(cfg, ctx)
+    facade.bind_host = "127.0.0.1"
+    facade.port = cfg.port
+    return facade
+
+
+def test_negotiate_realism_guid_time_dialect():
+    import time
+
+    from rangefinder.facades.smb import _server_identity
+
+    async def run():
+        cfg = SmbConfig(port=_free_port(), max_dialect="3.0",
+                        shares=[SmbShare(name="Data", files={"a.txt": "x"})])
+        facade = _serve(cfg, "fs01")
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            full_ladder = [0x0202, 0x0210, 0x0300, 0x0302, 0x0311]
+            return await loop.run_in_executor(None, _raw_negotiate, cfg.port, full_ladder)
+        finally:
+            await facade.stop()
+
+    resp = asyncio.run(run())
+
+    # (1) highest common dialect <= ceiling, not impacket's hardcoded 2.0.2
+    assert resp["DialectRevision"] == 0x0300
+    # (2) per-host stable ServerGuid, not impacket's b'A' * 16
+    expected_guid, _ = _server_identity("fs01")
+    assert bytes(resp["ServerGuid"]) == expected_guid
+    assert bytes(resp["ServerGuid"]) != b"A" * 16
+    # (3) signing REQUIRED bit is set (default signing_required=True)
+    assert resp["SecurityMode"] & 0x2
+    # (4) ServerStartTime is a plausible past boot, distinct from a live SystemTime
+    def _epoch(ft):
+        return ft / 1e7 - 11644473600
+    sys_t, start_t = _epoch(resp["SystemTime"]), _epoch(resp["ServerStartTime"])
+    assert abs(sys_t - time.time()) < 30          # SystemTime is now
+    assert 3000 < (sys_t - start_t) < 46 * 86400   # uptime hours..~45 days, not zero
+
+
+def test_server_guid_unique_per_host():
+    from rangefinder.facades.smb import _server_identity
+
+    async def guid_for(hostname):
+        cfg = SmbConfig(port=_free_port(), shares=[SmbShare(name="Data")])
+        facade = _serve(cfg, hostname)
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, _raw_negotiate, cfg.port, [0x0202])
+            return bytes(resp["ServerGuid"])
+        finally:
+            await facade.stop()
+
+    g1 = asyncio.run(guid_for("dc01"))
+    g2 = asyncio.run(guid_for("ws01"))
+    assert g1 != g2
+    # stable: same host name -> same GUID (persists across "reboots")
+    assert g1 == _server_identity("dc01")[0]
+
+
+def test_signing_optional_and_dialect_ceiling():
+    async def run():
+        cfg = SmbConfig(port=_free_port(), signing_required=False, max_dialect="2.1",
+                        shares=[SmbShare(name="Data")])
+        facade = _serve(cfg, "ws01")
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _raw_negotiate, cfg.port,
+                                              [0x0202, 0x0210, 0x0300])
+        finally:
+            await facade.stop()
+
+    resp = asyncio.run(run())
+    assert resp["SecurityMode"] & 0x2 == 0     # not required
+    assert resp["SecurityMode"] & 0x1          # still enabled
+    assert resp["DialectRevision"] == 0x0210   # ceiling caps 3.0 offer down to 2.1
+
+
+def _parse_contexts(resp) -> dict:
+    """Decode a 3.1.1 negotiate response's context list -> {context_type: data_bytes}."""
+    blob = bytes(resp["NegotiateContextList"])
+    out, i = {}, 0
+    for _ in range(int(resp["NegotiateContextCount"])):
+        i += (8 - i % 8) % 8  # each context starts 8-byte aligned
+        ctype, dlen = struct.unpack("<HH", blob[i:i + 4])
+        out[ctype] = blob[i + 8:i + 8 + dlen]
+        i += 8 + dlen
+    return out
+
+
+def test_negotiate_311_contexts():
+    """3.1.1 is negotiated with a valid preauth-integrity context (mandatory) plus encryption
+    and signing capability contexts — what recon tooling reads as a modern Windows service."""
+    async def run():
+        cfg = SmbConfig(port=_free_port(), max_dialect="3.1.1",
+                        shares=[SmbShare(name="Data", files={"a.txt": "x"})])
+        facade = _serve(cfg, "dc01")
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            ladder = [0x0202, 0x0210, 0x0300, 0x0302, 0x0311]
+            return await loop.run_in_executor(None, _raw_negotiate, cfg.port, ladder)
+        finally:
+            await facade.stop()
+
+    resp = asyncio.run(run())
+    assert resp["DialectRevision"] == 0x0311
+    assert int(resp["NegotiateContextCount"]) == 3
+    assert int(resp["NegotiateContextOffset"]) % 8 == 0
+    # impacket can't do 3.x AES-CMAC signing, so 3.1.1 advertises signing but does not require it
+    assert resp["SecurityMode"] & 0x2 == 0
+
+    ctx = _parse_contexts(resp)
+    preauth = ctx[0x0001]  # SMB2_PREAUTH_INTEGRITY_CAPABILITIES (mandatory)
+    hash_count, salt_len, hash_alg = struct.unpack("<HHH", preauth[:6])
+    assert hash_count == 1 and hash_alg == 0x0001  # SHA-512
+    assert salt_len == 32 and len(preauth) == 6 + 32
+    assert struct.unpack("<H", ctx[0x0002][2:4])[0] == 0x0002  # AES-128-GCM
+    assert struct.unpack("<H", ctx[0x0008][2:4])[0] == 0x0001  # AES-CMAC signing
+
+
+def test_311_salt_is_fresh_per_negotiate():
+    """The preauth salt must be random per negotiate, not a fixed constant."""
+    async def run():
+        cfg = SmbConfig(port=_free_port(), max_dialect="3.1.1", shares=[SmbShare(name="D")])
+        facade = _serve(cfg, "dc01")
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            a = await loop.run_in_executor(None, _raw_negotiate, cfg.port, [0x0311])
+            b = await loop.run_in_executor(None, _raw_negotiate, cfg.port, [0x0311])
+            return _parse_contexts(a)[0x0001][6:], _parse_contexts(b)[0x0001][6:]
+        finally:
+            await facade.stop()
+
+    salt_a, salt_b = asyncio.run(run())
+    assert salt_a != salt_b and len(salt_a) == 32
+
+
+def test_select_dialect_ignores_negotiate_context_noise():
+    """A 3.1.1 request trails negotiate-context bytes after the dialect array; parsing must
+    honour DialectCount so those bytes aren't misread as bogus dialects (and picked)."""
+    from impacket import smb3structs as smb2
+
+    from rangefinder.facades.smb import _select_dialect
+
+    neg = smb2.SMB2Negotiate()
+    neg["DialectCount"] = 1
+    neg["Dialects"] = [0x0311]
+    neg["NegotiateContextList"] = b"\x02\x03\x00\x03\x00\x03\x00\x03"  # would look like dialects
+    pkt = smb2.SMB2Packet()
+    pkt["Command"] = smb2.SMB2_NEGOTIATE
+    pkt["Data"] = neg
+
+    recv = smb2.SMB2Packet(pkt.getData())
+    # 3.1.1-only client, ceiling 3.0 -> no common dialect -> fall back (None), never the noise
+    assert _select_dialect(smb2, recv, False, 0x0300) is None

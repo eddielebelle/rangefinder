@@ -177,6 +177,12 @@ class SmbConfig(ServiceBase):
     port: int = Field(default=445, ge=1, le=65535)
     signing_required: bool = True
     server_os: str = "Windows Server 2022 Standard 20348"
+    # Highest SMB2 dialect the negotiate response will advertise. The facade adds proper
+    # 3.1.1 negotiate contexts (preauth-integrity + encryption/signing capabilities) so recon
+    # tooling sees a modern Windows service; anonymous enumeration works at every dialect.
+    # (A signed/credentialed 3.1.1 session needs AES-CMAC the impacket backend can't do, so
+    # signing stays advertised-not-required at 3.1.1 — see the facade's signing note.)
+    max_dialect: Literal["2.0.2", "2.1", "3.0", "3.1.1"] = "3.1.1"
     shares: list[SmbShare] = Field(default_factory=list)
 
 
@@ -197,13 +203,26 @@ class DnsConfig(ServiceBase):
     autofill_hosts: bool = True
 
 
+class RdpConfig(ServiceBase):
+    type: Literal["rdp"] = "rdp"
+    port: int = Field(default=3389, ge=1, le=65535)
+    # A modern hardened Windows host requires CredSSP/NLA: it answers the X.224 negotiation,
+    # upgrades to TLS, and challenges over CredSSP (which leaks its name/domain/OS). When
+    # False the host also accepts plain TLS (PROTOCOL_SSL) without NLA.
+    nla_required: bool = True
+    # Leaked to rdp-ntlm-info via the NTLM Version field in the CredSSP challenge, so it must
+    # match the host: Server 2022=10.0.20348, Server 2019=10.0.17763, Win11=10.0.22631,
+    # Win10=10.0.19045.
+    os_version: str = "10.0.20348"
+
+
 # The discriminated union authored in host.services[]. The discriminator lets pydantic
 # route each object to the right model by its "type" key, and produces a JSON Schema
 # oneOf that editors use for per-variant autocomplete.
 BuiltinService = Annotated[
-    Union[HttpConfig, BannerConfig, SshConfig, KerberosConfig, LdapConfig, SmbConfig, DnsConfig],
+    Union[HttpConfig, BannerConfig, SshConfig, KerberosConfig, LdapConfig, SmbConfig, DnsConfig, RdpConfig],
     Field(discriminator="type"),
 ]
 
 # Service types that have a working runtime facade in this release.
-IMPLEMENTED_TYPES = frozenset({"http", "banner", "ssh", "kerberos", "ldap", "smb", "dns"})
+IMPLEMENTED_TYPES = frozenset({"http", "banner", "ssh", "kerberos", "ldap", "smb", "dns", "rdp"})
