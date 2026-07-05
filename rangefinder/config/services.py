@@ -207,7 +207,7 @@ class DnsRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    type: Literal["A", "AAAA", "CNAME", "TXT", "SRV", "MX"] = "A"
+    type: Literal["A", "AAAA", "CNAME", "TXT", "SRV", "MX", "SOA", "NS"] = "A"
     value: str
     ttl: int = 300
 
@@ -218,6 +218,11 @@ class DnsConfig(ServiceBase):
     zone: str | None = None  # default from identities.domain
     records: list[DnsRecord] = Field(default_factory=list)
     autofill_hosts: bool = True
+    # Security posture (FAIL-CLOSED). A zone transfer (AXFR) leaking the whole zone is a classic
+    # anonymous exposure; the twin reproduces it only when the capture measured the real server
+    # permitting it. Default False = refuse AXFR, so an unmeasured host can never fabricate a
+    # "zone transfer allowed" finding. Capture overwrites this with the measured value.
+    axfr_allowed: bool = False
 
 
 class RdpConfig(ServiceBase):

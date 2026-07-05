@@ -144,3 +144,108 @@ def test_udp_end_to_end():
     resp = asyncio.run(run())
     _, an, answers = _parse_answers(resp)
     assert an == 1 and socket.inet_ntoa(answers[0][1]) == "10.13.37.10"
+
+
+def _axfr_query(zone: str) -> bytes:
+    header = struct.pack("!HHHHHH", 0x1234, 0x0000, 1, 0, 0, 0)
+    return header + _encode_name(zone) + struct.pack("!HH", 252, 1)  # qtype 252 = AXFR
+
+
+def _parse_axfr(resp):
+    """A served AXFR is a list of messages (chunked); flatten their answer RRs into one list."""
+    assert isinstance(resp, list)
+    flags0, rrs = None, []
+    for msg in resp:
+        flags, _, part = _parse_answers(msg)
+        flags0 = flags if flags0 is None else flags0
+        rrs.extend(part)
+    return flags0, rrs
+
+
+def test_axfr_served_over_tcp_when_allowed():
+    ctx, sink = _ctx()
+    cfg = _cfg().model_copy(update={"axfr_allowed": True})
+    facade = DnsFacade.from_config(cfg, ctx)
+    resp = facade.build_response(_axfr_query("corp.local"), "10.0.0.9", 5300, "tcp")
+    flags, rrs = _parse_axfr(resp)
+    assert (flags & 0x000F) == 0            # NOERROR
+    assert len(rrs) >= 3                    # SOA + >=1 record + SOA
+    assert rrs[0][0] == 6 and rrs[-1][0] == 6   # bracketed by the zone SOA (type 6)
+    # the whole zone leaks — the autofilled dc01 A record rides along in the transfer
+    assert any(rtype == 1 and socket.inet_ntoa(rd) == "10.13.37.10" for rtype, rd in rrs)
+    q = next(e for e in sink.events if e["event"]["action"] == "dns_query")
+    assert q["dns"]["response_code"] == "NOERROR"
+
+
+def test_axfr_refused_for_foreign_zone_even_when_allowed():
+    """AXFR is served only for the zone the twin is authoritative for; a transfer of some other
+    zone name is REFUSED, like a real server — not answered with this zone's records."""
+    ctx, _ = _ctx()
+    cfg = _cfg().model_copy(update={"axfr_allowed": True})
+    facade = DnsFacade.from_config(cfg, ctx)
+    resp = facade.build_response(_axfr_query("evil.example"), "10.0.0.9", 5300, "tcp")
+    flags, an, _ = _parse_answers(resp)   # single REFUSED message, not a list
+    assert an == 0
+    assert (flags & 0x000F) == 5           # REFUSED
+
+
+def test_axfr_chunked_across_messages_for_large_zone():
+    """A zone too big for one 64 KB TCP message is split across several, each SOA/record framed —
+    so a real (large AD) zone transfer doesn't overflow the length prefix."""
+    ctx, _ = _ctx()
+    big = [DnsRecord(name=f"h{i}", type="TXT", value="x" * 250) for i in range(400)]
+    cfg = _cfg().model_copy(update={"axfr_allowed": True, "records": _cfg().records + big})
+    facade = DnsFacade.from_config(cfg, ctx)
+    resp = facade.build_response(_axfr_query("corp.local"), "10.0.0.9", 5300, "tcp")
+    assert isinstance(resp, list) and len(resp) >= 2      # actually chunked
+    assert all(len(msg) <= 65535 for msg in resp)         # every message fits the length prefix
+    flags, rrs = _parse_axfr(resp)
+    assert (flags & 0x000F) == 0 and rrs[0][0] == 6 and rrs[-1][0] == 6
+
+
+def test_axfr_refused_when_not_allowed():
+    facade, sink = _facade()  # axfr_allowed defaults False (fail-closed)
+    resp = facade.build_response(_axfr_query("corp.local"), "10.0.0.9", 5300, "tcp")
+    flags, an, _ = _parse_answers(resp)
+    assert an == 0
+    assert (flags & 0x000F) == 5            # REFUSED, like a hardened server
+    q = next(e for e in sink.events if e["event"]["action"] == "dns_query")
+    assert q["dns"]["response_code"] == "REFUSED"
+
+
+def test_axfr_refused_over_udp_even_when_allowed():
+    ctx, _ = _ctx()
+    cfg = _cfg().model_copy(update={"axfr_allowed": True})
+    facade = DnsFacade.from_config(cfg, ctx)
+    resp = facade.build_response(_axfr_query("corp.local"), "10.0.0.9", 5300, "udp")
+    flags, an, _ = _parse_answers(resp)
+    assert an == 0
+    assert (flags & 0x000F) == 5            # AXFR is TCP-only; refuse over UDP
+
+
+def test_capture_measures_axfr_posture():
+    """Capturing a server that permits AXFR records axfr_allowed=True as measured provenance and
+    pulls the whole zone (the transfer being allowed is itself the exposure)."""
+    from rangefinder.capture.dns import capture_dns
+
+    async def run():
+        ctx, _ = _ctx()
+        cfg = _cfg().model_copy(update={"axfr_allowed": True})
+        facade = DnsFacade.from_config(cfg, ctx)
+        facade.bind_host = "127.0.0.1"
+        facade.port = 0
+        await facade.start()
+        tcp_port = facade._tcp_server.sockets[0].getsockname()[1]
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: capture_dns("127.0.0.1", tcp_port, zone="corp.local", timeout=3.0))
+        finally:
+            await facade.stop()
+
+    service, warnings, report = asyncio.run(run())
+    assert service["axfr_allowed"] is True
+    status = {i.field: i.status for i in report.items}
+    assert status.get("axfr_allowed") == "measured"
+    # the zone leaked via the transfer — the autofilled dc01 A record came through
+    assert any(r["type"] == "A" and r["value"] == "10.13.37.10" for r in service["records"])
