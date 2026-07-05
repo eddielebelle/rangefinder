@@ -105,6 +105,13 @@ def capture_http(
             continue
         routes[path] = _route(resp, scrubber)
 
+    # Method posture: OPTIONS advertises the allowed methods; TRACE echoing the request is the
+    # Cross-Site Tracing (XST) exposure. Both are safe to probe (no state change).
+    allowed_methods = _probe_allowed_methods(opener, base, timeout)
+    trace_enabled = _probe_trace(opener, base, timeout)
+    trace_measured = trace_enabled is not None
+    trace_enabled = bool(trace_enabled)
+
     service: dict = {"type": "http", "port": port}
     if tls:
         service["tls"] = True
@@ -116,6 +123,9 @@ def capture_http(
         service["default_body"] = apply(scrubber, default_body)[:_MAX_BODY]
     if routes:
         service["paths"] = routes
+    service["trace_enabled"] = trace_enabled
+    if allowed_methods:
+        service["allowed_methods"] = allowed_methods
 
     warnings.append(f"captured {len(routes)} live route(s) from {base} ({probed} probed)")
 
@@ -126,6 +136,18 @@ def capture_http(
         report.measured("server_header", apply(scrubber, server_header), "Server response header")
     report.measured("routes", f"{len(routes)} live", f"{probed} paths probed")
     report.measured("default_status", default_status, "response to an unknown path")
+    if trace_measured:
+        report.measured("trace_enabled", trace_enabled,
+                        "TRACE " + ("echoed the request — Cross-Site Tracing" if trace_enabled
+                                    else "refused"))
+    else:
+        report.assumed("trace_enabled", False, "TRACE not probeable; assumed disabled (fail-closed)")
+    if allowed_methods:
+        report.measured("allowed_methods", ", ".join(allowed_methods), "OPTIONS Allow header")
+    else:
+        report.assumed("allowed_methods", "(not advertised)",
+                       "OPTIONS not answered with an Allow header; the twin won't advertise "
+                       "methods either (fail-closed — no fabricated OPTIONS surface)")
     # Auth-gated routes prove a boundary exists; what sits *behind* it is another perspective.
     gated = sorted(p for p, r in routes.items() if r.get("status") in (401, 403))
     if gated:
@@ -134,6 +156,36 @@ def capture_http(
                             + ", ".join(gated[:3]) + (" …" if len(gated) > 3 else "")
                             + " not measured. Re-capture with credentials to reach it.")
     return service, warnings, report
+
+
+# The capture User-Agent (see _fetch) doubles as the marker that confirms a TRACE echo: a real
+# TRACE-enabled server reflects the whole request — including this UA — back in the body, whereas
+# a benign 200 page that merely mentions "TRACE" does not contain it.
+_TRACE_MARKER = b"rangefinder-capture"
+
+
+def _probe_allowed_methods(opener, base: str, timeout: float) -> list[str] | None:
+    """The methods the server advertises via ``OPTIONS /`` — but only when it actually *answers*
+    OPTIONS (2xx with an Allow header). A 4xx/5xx (OPTIONS not supported) returns None, so the twin
+    doesn't fabricate OPTIONS support the real server lacks."""
+    resp = _fetch(opener, base + "/", timeout, method="OPTIONS")
+    if resp is None or resp.status not in (200, 204):
+        return None
+    allow = resp.headers.get("allow")
+    if not allow:
+        return None
+    methods = [m.strip().upper() for m in allow.split(",") if m.strip()]
+    return methods or None
+
+
+def _probe_trace(opener, base: str, timeout: float) -> bool | None:
+    """Whether TRACE is enabled (Cross-Site Tracing): True if the server echoes our request back,
+    False if it refuses, None if unreachable. Confirms the echo by looking for the request marker
+    (our User-Agent) in the body, not a loose 'TRACE' substring that a benign page could contain."""
+    resp = _fetch(opener, base + "/", timeout, method="TRACE")
+    if resp is None:
+        return None
+    return bool(resp.status == 200 and _TRACE_MARKER in (resp.body or b""))
 
 
 def _route(resp: _Resp, scrubber: Scrubber | None) -> dict:
@@ -175,8 +227,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _fetch(opener, url: str, timeout: float) -> _Resp | None:
-    req = urllib.request.Request(url, headers={"User-Agent": "rangefinder-capture/1.0"})
+def _fetch(opener, url: str, timeout: float, method: str = "GET") -> _Resp | None:
+    req = urllib.request.Request(url, headers={"User-Agent": "rangefinder-capture/1.0"},
+                                 method=method)
     try:
         resp = opener.open(req, timeout=timeout)
         return _Resp(resp.status, _headers(resp), resp.read(_MAX_BODY + 1))

@@ -19,7 +19,7 @@ def _facade():
 
 def _req(auth=None):
     headers = {"authorization": auth} if auth else {}
-    return _Request("GET", "/owa", "/owa", None, "1.1", headers, 0, False)
+    return _Request("GET", "/owa", "/owa", None, "1.1", headers, 0, False, b"")
 
 
 def _b64(b):

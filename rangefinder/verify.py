@@ -174,8 +174,7 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
     real_port = parsed.port or (443 if parsed.scheme == "https" else 80)
     paths = sorted((service.get("paths") or {}).keys())
     if not paths:
-        report.warnings.append("no routes captured; nothing to verify")
-        return report
+        report.warnings.append("no routes captured; verifying method posture only")
 
     compare_headers = _KEEP_HEADERS | {"server"}
     opener = _build_opener(True)
@@ -191,6 +190,31 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
             else:
                 report.matched += 1
 
+        # Method posture diff: the twin must reproduce TRACE/XST and the OPTIONS method-advertising
+        # behaviour, not just the route content. Probe live on both sides. real_trace is None only
+        # when the real server was unreachable, so it gates whether we score at all — otherwise an
+        # unobserved posture would be silently rubber-stamped as a match.
+        real_trace, real_methods = _http_method_posture(opener, real_base, timeout)
+        repl_trace, repl_methods = _http_method_posture(opener, repl_base, timeout)
+        if real_trace is not None:
+            report.total += 1
+            if real_trace == repl_trace:
+                report.matched += 1
+            else:
+                report.divergences.append(Divergence(
+                    "posture:trace_enabled", "posture",
+                    f"real TRACE enabled={real_trace} vs replica {repl_trace}"))
+            # None==None (neither advertises OPTIONS) is a match; a real 405/404 vs a fabricated
+            # replica 200+Allow is a divergence — the status matters, not just the method set.
+            report.total += 1
+            if real_methods == repl_methods:
+                report.matched += 1
+            else:
+                report.divergences.append(Divergence(
+                    "posture:allowed_methods", "posture",
+                    f"real {sorted(real_methods) if real_methods else None} vs "
+                    f"replica {sorted(repl_methods) if repl_methods else None}"))
+
         # Fidelity boundary: an uncaptured path falls back to the facade default, which is
         # where the replica stops matching. Probe one and report it (not counted).
         absent = "/rf-verify-absent-" + "z" * 8
@@ -204,7 +228,7 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
         time.sleep(0.15)  # let the last handler flush its event
         _detection(report, srv.events, expected_paths=paths)
 
-        if nmap:  # recon-tool perspective: does nmap -sV fingerprint them the same?
+        if nmap and paths:  # recon-tool perspective: does nmap -sV fingerprint them the same?
             _add_nmap(report, real_host, real_port, srv.port, timeout=90.0)
     return report
 
@@ -275,6 +299,17 @@ def _diff_http(path, real, repl, compare_headers) -> list[Divergence]:
     if real.body != repl.body:
         divs.append(Divergence(path, "body", f"{len(real.body)}B real vs {len(repl.body)}B replica"))
     return divs
+
+
+def _http_method_posture(opener, base: str, timeout: float):
+    """(trace_enabled, allowed_methods) from live OPTIONS/TRACE probes — reusing the capture probes
+    so verify and capture classify identically (no drift). trace is None if unreachable;
+    allowed_methods is None when the server doesn't answer OPTIONS with an Allow header."""
+    from rangefinder.capture.http import _probe_allowed_methods, _probe_trace
+
+    trace = _probe_trace(opener, base, timeout)
+    methods = _probe_allowed_methods(opener, base, timeout)
+    return trace, (frozenset(methods) if methods else None)
 
 
 # ------------------------------------------------------------------------------- LDAP

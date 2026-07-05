@@ -110,3 +110,51 @@ def test_telemetry_records_user_agent_and_status():
     assert req["user_agent"]["original"] == "gobuster/3.6"
     assert req["url"]["query"] == "q=1"
     assert req["http"]["response"]["status_code"] == 200
+
+
+def test_options_advertises_allowed_methods():
+    facade, _ = _facade(paths={"/": HttpPath(body="x")},
+                        allowed_methods=["GET", "HEAD", "POST", "OPTIONS"])
+    data = asyncio.run(serve_and_exchange(facade, _req("/", "OPTIONS")))
+    assert data.startswith(b"HTTP/1.1 200 ")
+    assert b"Allow: GET, HEAD, POST, OPTIONS" in data
+
+
+def test_trace_echoes_when_enabled():
+    facade, _ = _facade(paths={"/": HttpPath(body="x")}, trace_enabled=True)
+    data = asyncio.run(serve_and_exchange(facade, _req("/", "TRACE")))
+    assert data.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b"message/http" in data
+    assert b"TRACE / HTTP/1.1" in data          # the request is echoed back (XST)
+
+
+def test_trace_refused_by_default():
+    facade, _ = _facade(paths={"/": HttpPath(body="x")})  # trace_enabled defaults False
+    data = asyncio.run(serve_and_exchange(facade, _req("/", "TRACE")))
+    assert data.startswith(b"HTTP/1.1 405 Method Not Allowed\r\n")
+    assert b"TRACE / HTTP/1.1" not in data       # nothing echoed — fail-closed
+
+
+def test_options_does_not_bypass_auth_or_fabricate_paths():
+    """OPTIONS is resource-scoped, not a server-wide 200: on a gated route it still challenges,
+    and on an unknown path it 404s — it must not fabricate accessible surface (fail-closed)."""
+    facade, _ = _facade(
+        allowed_methods=["GET", "HEAD", "POST", "OPTIONS"],
+        paths={
+            "/": HttpPath(body="home"),
+            "/admin": HttpPath(body="secret", auth_realm="admin", auth_users={"a": "b"}),
+        })
+    ok = asyncio.run(serve_and_exchange(facade, _req("/", "OPTIONS")))
+    assert ok.startswith(b"HTTP/1.1 200 ") and b"Allow: GET, HEAD, POST, OPTIONS" in ok
+    gated = asyncio.run(serve_and_exchange(facade, _req("/admin", "OPTIONS")))
+    assert gated.startswith(b"HTTP/1.1 401 ")          # auth not bypassed
+    missing = asyncio.run(serve_and_exchange(facade, _req("/nope", "OPTIONS")))
+    assert missing.startswith(b"HTTP/1.1 404 ")        # no fabricated endpoint
+
+
+def test_options_not_advertised_when_unmeasured():
+    """With allowed_methods unmeasured (None, the fail-closed default), OPTIONS is not answered
+    with a fabricated 200 + Allow — it falls through to the normal 405."""
+    facade, _ = _facade(paths={"/": HttpPath(methods=["GET"], body="x")})  # allowed_methods=None
+    data = asyncio.run(serve_and_exchange(facade, _req("/", "OPTIONS")))
+    assert data.startswith(b"HTTP/1.1 405 Method Not Allowed\r\n")
