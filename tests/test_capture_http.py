@@ -113,3 +113,19 @@ def test_capture_measures_method_posture():
     status = {i.field: i.status for i in report.items}
     assert status.get("trace_enabled") == "measured"
     assert status.get("allowed_methods") == "measured"
+
+
+def test_unreachable_target_fails_closed():
+    """A dead port must not yield a phantom http facade — capture fails closed instead of
+    fabricating a service the real estate doesn't run (amplified by `capture --append`)."""
+    import socket
+
+    import pytest
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))          # reserve a port, then close it so nothing is listening
+    port = s.getsockname()[1]
+    s.close()
+
+    with pytest.raises(ValueError, match="no HTTP service reachable"):
+        capture_http(f"http://127.0.0.1:{port}/", timeout=1.0)

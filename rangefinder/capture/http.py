@@ -89,6 +89,11 @@ def capture_http(
     server_header: str | None = None
     routes: dict[str, dict] = {}
     probed = 0
+    # Reachability: only emit a facade if the target actually answered. A dead port answers nothing,
+    # and fabricating an http service the real estate doesn't run is the fail-open the contract
+    # forbids (worse via `capture --append`, which would inject a phantom host into an estate). Any
+    # of the home page, robots.txt, or the 404 baseline answering proves the service is live.
+    got_response = home is not None or robots is not None or baseline is not None
     for path in sorted(to_probe):
         if probed >= max_paths:
             warnings.append(f"probe cap {max_paths} reached; some paths not captured")
@@ -97,6 +102,7 @@ def capture_http(
         resp = _fetch(opener, base + path, timeout)
         if resp is None:
             continue
+        got_response = True
         if server_header is None:
             server_header = resp.headers.get("server")
         # Keep it only if it's a real endpoint (not the generic 404) — the existence and
@@ -111,6 +117,13 @@ def capture_http(
     trace_enabled = _probe_trace(opener, base, timeout)
     trace_measured = trace_enabled is not None
     trace_enabled = bool(trace_enabled)
+
+    # A definitive answer to any probe (a route, the OPTIONS Allow, or the TRACE result) also proves
+    # the service is live; without any of it, fail closed rather than emit a phantom facade.
+    if not (got_response or trace_measured or allowed_methods):
+        raise ValueError(
+            f"no HTTP service reachable at {base} — nothing answered ({probed} paths probed); "
+            f"not emitting a facade (fail-closed)")
 
     service: dict = {"type": "http", "port": port}
     if tls:
