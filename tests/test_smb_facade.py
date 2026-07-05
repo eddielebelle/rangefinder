@@ -458,6 +458,118 @@ def test_restrict_anonymous_share_enumerable_but_not_connectable():
     assert public == "granted"            # normal shares unaffected
 
 
+# ------------------------------------------------------- auth/protocol posture
+
+
+def test_smb1_refused_by_default_accepted_when_enabled():
+    """SMB1 (NT LM 0.12) is a facade default impacket answers even with SMB2 on. A captured host
+    with SMB1 disabled must refuse it — the twin should present SMB2/3-only unless smb1_enabled."""
+    def client(port):
+        from impacket.smbconnection import SMBConnection
+
+        out = {}
+        try:  # SMB2 path unaffected
+            c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+            c.login("", "")
+            out["smb2"] = "ok"
+            c.close()
+        except Exception as exc:
+            out["smb2"] = "ERR:" + type(exc).__name__
+        try:  # pure SMB1 negotiate
+            c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port, preferredDialect="NT LM 0.12")
+            c.login("", "")
+            out["smb1"] = "accepted"
+            c.close()
+        except Exception:
+            out["smb1"] = "refused"
+        return out
+
+    async def run(smb1_enabled):
+        # reject_unknown_users=False here so SMB1 null login isn't also gated by the
+        # guest-disable credential — this test isolates the smb1_enabled knob.
+        cfg = SmbConfig(port=_free_port(), smb1_enabled=smb1_enabled, reject_unknown_users=False,
+                        shares=[SmbShare(name="Data", files={"a.txt": "x"})])
+        facade = _serve(cfg, "fs01")
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, cfg.port)
+        finally:
+            await facade.stop()
+
+    off = asyncio.run(run(False))
+    on = asyncio.run(run(True))
+    assert off["smb2"] == "ok" and off["smb1"] == "refused"   # default: SMB1 off, SMB2 fine
+    assert on["smb1"] == "accepted"                            # opt-in restores SMB1
+
+
+def test_unknown_user_rejected_by_default_guest_when_opted_out():
+    """impacket maps any credential to guest when no accounts are registered, so a bogus login
+    'authenticates' — a false finding. reject_unknown_users (default) must refuse unknown accounts
+    while leaving null-session enumeration open."""
+    def client(port):
+        from impacket.smbconnection import SMBConnection
+
+        out = {}
+        try:  # null session still enumerates
+            c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+            c.login("", "")
+            out["null"] = "ok:" + str(len(c.listShares()))
+            c.close()
+        except Exception as exc:
+            out["null"] = "ERR:" + type(exc).__name__
+        try:  # bogus credential
+            c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+            c.login("nobody", "wrongpass")
+            out["bogus"] = "accepted"
+            c.close()
+        except Exception:
+            out["bogus"] = "rejected"
+        return out
+
+    async def run(reject):
+        cfg = SmbConfig(port=_free_port(), reject_unknown_users=reject,
+                        shares=[SmbShare(name="Data", files={"a.txt": "x"})])
+        facade = _serve(cfg, "fs01")
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, cfg.port)
+        finally:
+            await facade.stop()
+
+    strict = asyncio.run(run(True))
+    lax = asyncio.run(run(False))
+    assert strict["null"].startswith("ok") and strict["bogus"] == "rejected"   # default: reject
+    assert lax["bogus"] == "accepted"                                          # opt-out: guest map
+
+
+def test_default_client_negotiates_configured_dialect():
+    """impacket's default client (like nmap/Windows) sends an SMB1 multi-protocol negotiate
+    offering 'SMB 2.???'. impacket upgrades it but hardcodes 2.0.2 — the twin must instead honour
+    the captured max_dialect, or it fingerprints as SMB 2.0.2 while the real host reports 3.1.1."""
+    def client(port):
+        from impacket.smbconnection import SMBConnection
+
+        c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+        c.login("", "")
+        d = c.getDialect()
+        c.close()
+        return d
+
+    async def run(max_dialect):
+        cfg = SmbConfig(port=_free_port(), max_dialect=max_dialect,
+                        shares=[SmbShare(name="Data", files={"a.txt": "x"})])
+        facade = _serve(cfg, "fs01")
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, cfg.port)
+        finally:
+            await facade.stop()
+
+    assert asyncio.run(run("3.1.1")) == 0x0311   # not impacket's hardcoded 0x0202
+    assert asyncio.run(run("3.0")) == 0x0300
+    assert asyncio.run(run("2.1")) == 0x0210
+
+
 def test_select_dialect_ignores_negotiate_context_noise():
     """A 3.1.1 request trails negotiate-context bytes after the dialect array; parsing must
     honour DialectCount so those bytes aren't misread as bogus dialects (and picked)."""

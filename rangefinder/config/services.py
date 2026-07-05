@@ -189,6 +189,17 @@ class SmbConfig(ServiceBase):
     # (A signed/credentialed 3.1.1 session needs AES-CMAC the impacket backend can't do, so
     # signing stays advertised-not-required at 3.1.1 — see the facade's signing note.)
     max_dialect: Literal["2.0.2", "2.1", "3.0", "3.1.1"] = "3.1.1"
+    # Security posture. Defaults are FAIL-CLOSED (restrictive): a field the capture could not
+    # measure must never make the twin *more* exposed than the real host, since a fail-open
+    # default fabricates findings. Capture overwrites these with measured values and records the
+    # provenance (measured / assumed) in the capture report.
+    #   smb1_enabled: answer the legacy SMB1 (NT LM 0.12) negotiate. Modern hosts disable it; a
+    #     disabled twin refuses the SMB1 negotiate (no common dialect), as the real host does.
+    #   reject_unknown_users: reject a non-anonymous logon whose account isn't known (real
+    #     hardened behaviour), instead of impacket's default of mapping any credential to guest.
+    #     Null-session (anonymous) enumeration is unaffected either way.
+    smb1_enabled: bool = False
+    reject_unknown_users: bool = True
     shares: list[SmbShare] = Field(default_factory=list)
 
 

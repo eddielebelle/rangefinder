@@ -14,7 +14,14 @@ Fidelity of the access surface: `readonly` shares reject writes with STATUS_ACCE
 (impacket enforces `read only`), IPC$ is re-pointed off the process CWD so it can't leak the
 container's install tree, and a share captured as `restrict_anonymous` is enumerable but
 refuses a null-session tree connect — so a captured access decision is reproduced rather than
-served wide open. One SMB facade per host is assumed (the log handler is process-wide).
+served wide open.
+
+Fidelity of the security posture: the facade honours captured fields rather than shipping
+impacket's permissive defaults — `smb1_enabled=False` refuses the legacy SMB1 negotiate,
+`reject_unknown_users` refuses bogus logons instead of mapping them to guest, and the negotiate
+advertises the captured `max_dialect` even on the default SMB1-multiprotocol negotiate path.
+All default to the restrictive (fail-closed) value so an unmeasured posture never over-exposes
+the twin. One SMB facade per host is assumed (the log handler is process-wide).
 """
 
 from __future__ import annotations
@@ -195,6 +202,8 @@ class SmbFacade(Facade):
         self._boot_epoch = time.time() - self._uptime_offset
         self._neuter_ipc_share(srv, inner)
         self._install_negotiate_realism(inner)
+        if not self.cfg.smb1_enabled:
+            self._install_smb1_policy(inner)
         # Shares a null/anonymous session must be refused (enumerable, not readable). Compared
         # case-insensitively in the tree-connect hook.
         self._restricted = {s.name.upper() for s in self.cfg.shares if s.restrict_anonymous}
@@ -209,6 +218,7 @@ class SmbFacade(Facade):
         # validates authenticated logons (pass-the-hash succeeds with the right hash, wrong
         # hash fails) while null-session enumeration still works.
         ids = self.ctx.identities
+        registered_creds = False
         if ids:
             from binascii import hexlify
 
@@ -217,6 +227,22 @@ class SmbFacade(Facade):
             for u in ids.users:
                 if u.password:
                     srv.addCredential(u.sam, 0, "", hexlify(compute_nthash(u.password)).decode())
+                    registered_creds = True
+
+        # Guest-fallback control. impacket maps ANY credential to a guest session when no
+        # credentials are registered — so a bogus user/password "authenticates". A real hardened
+        # host rejects unknown accounts. When reject_unknown_users is set and no real identity
+        # was registered above, register one unusable credential (random NT hash): that flips
+        # impacket onto its "validate credentials -> STATUS_LOGON_FAILURE for unknown" path.
+        # Anonymous null-session enumeration over SMB2 is a separate code path and stays open.
+        # (Caveat: registering a credential also gates SMB1 *null* logins, so a host with both
+        # SMB1 enabled and reject_unknown_users set won't serve SMB1 null sessions — an accepted
+        # gap, since that legacy combination is rare and SMB1-disabled hosts never hit it.)
+        if self.cfg.reject_unknown_users and not registered_creds:
+            import os as _os
+            from binascii import hexlify as _hexlify
+
+            srv.addCredential("__rangefinder_absent__", 0, "", _hexlify(_os.urandom(16)).decode())
 
         self._install_telemetry()
 
@@ -280,6 +306,13 @@ class SmbFacade(Facade):
                 cmd["SystemTime"] = POSIXtoFT(now)
                 cmd["ServerStartTime"] = POSIXtoFT(int(self._boot_epoch or now))
                 chosen = _select_dialect(smb2, recv_packet, is_smb1, ceiling)
+                if chosen is None and is_smb1 and int(cmd["DialectRevision"]) in _DIALECTS.values():
+                    # Multi-protocol negotiate: an SMB1 client that offered "SMB 2.???" (the
+                    # default impacket/nmap/Windows client does) — impacket upgrades it to SMB2
+                    # but hardcodes 2.0.2. The wildcard means "your highest", so honour the
+                    # captured ceiling instead, or the twin fingerprints as SMB 2.0.2 while the
+                    # real host reports 3.1.1.
+                    chosen = ceiling
                 if chosen is not None:
                     cmd["DialectRevision"] = chosen
                 if chosen == _DIALECT_311:
@@ -322,6 +355,36 @@ class SmbFacade(Facade):
             return original(conn_id, smb_server, recv_packet)
 
         inner.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, _hook)
+
+    # ---- SMB1 availability ------------------------------------------------------
+    def _install_smb1_policy(self, inner) -> None:
+        """Refuse the legacy SMB1 (NT LM 0.12) negotiate, as a modern host with SMB1 disabled does.
+
+        A client that offers only SMB1 dialects (no ``SMB 2.002`` / ``SMB 2.???``) makes impacket
+        fall back to its SMB1 negotiate handler and answer NT LM 0.12 — so the twin speaks SMB1
+        even though the captured host doesn't. We replace that handler with one that returns an
+        SMB1 negotiate response whose DialectIndex is 0xFFFF ("none of your dialects accepted"),
+        the protocol-correct refusal. An SMB1-only client then fails to negotiate exactly as it
+        does against the real host — a clean rejection, not an emulator error. SMB2/3 clients are
+        untouched (they never reach the SMB1 handler).
+        """
+        import struct as _struct
+
+        from impacket import smb
+
+        def _refuse(conn_id, smb_server, smb_command, recv_packet):
+            resp = smb.NewSMBPacket()
+            resp["Flags1"] = smb.SMB.FLAGS1_REPLY
+            resp["Pid"] = recv_packet["Pid"]
+            resp["Tid"] = recv_packet["Tid"]
+            resp["Mid"] = recv_packet["Mid"]
+            cmd = smb.SMBCommand(smb.SMB.SMB_COM_NEGOTIATE)
+            cmd["Parameters"] = _struct.pack("<H", 0xFFFF)  # DialectIndex: no common dialect
+            cmd["Data"] = b""
+            resp.addCommand(cmd)
+            return None, [resp], 0  # STATUS_SUCCESS carrying the "no dialect" answer
+
+        inner.hookSmbCommand(smb.SMB.SMB_COM_NEGOTIATE, _refuse)
 
     # ---- access control ---------------------------------------------------------
     def _install_access_control(self, inner) -> None:
