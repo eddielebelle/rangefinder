@@ -95,6 +95,14 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_dns.add_argument("--host-id", default=None)
     p_cap_dns.add_argument("--scrub", action="store_true", help="redact captured secrets")
 
+    p_cap_ssh = capture_sub.add_parser("ssh", help="capture a live SSH server's posture -> ssh facade")
+    p_cap_ssh.add_argument("host", help="SSH server host or IP")
+    p_cap_ssh.add_argument("--port", type=int, default=22)
+    p_cap_ssh.add_argument("-o", "--out", type=Path, default=None)
+    p_cap_ssh.add_argument("--name", default=None, help="range name")
+    p_cap_ssh.add_argument("--host-id", default=None)
+    p_cap_ssh.add_argument("--scrub", action="store_true", help="(no-op for ssh; posture holds no secrets)")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -143,6 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     p_v_dns.add_argument("--zone", required=True, help="zone, e.g. acme.corp")
     p_v_dns.add_argument("--port", type=int, default=53)
     p_v_dns.add_argument("--json", action="store_true", help="emit the report as JSON")
+
+    p_v_ssh = verify_sub.add_parser("ssh", help="capture + diff a live SSH server's posture")
+    p_v_ssh.add_argument("host", help="SSH server host or IP")
+    p_v_ssh.add_argument("--port", type=int, default=22)
+    p_v_ssh.add_argument("--json", action="store_true", help="emit the report as JSON")
 
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
@@ -273,6 +286,16 @@ def cmd_capture(args) -> int:
             print(f"error: DNS capture failed: {exc}", file=sys.stderr)
             return EXIT_ERROR
         default_id = "ns"
+    elif args.captor == "ssh":
+        from rangefinder.capture.ssh import capture_ssh
+
+        hostname = args.host
+        try:
+            service, warnings, capture_report = capture_ssh(hostname, args.port)
+        except (ValueError, OSError) as exc:
+            print(f"error: SSH capture failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        default_id = "ssh"
     else:
         print(f"error: unknown captor {args.captor!r}", file=sys.stderr)
         return EXIT_ERROR
@@ -476,7 +499,7 @@ def cmd_detect(args) -> int:
 def cmd_verify(args) -> int:
     import dataclasses
 
-    from rangefinder.verify import verify_dns, verify_http, verify_ldap, verify_smb
+    from rangefinder.verify import verify_dns, verify_http, verify_ldap, verify_smb, verify_ssh
 
     try:
         if args.proto == "http":
@@ -486,6 +509,8 @@ def cmd_verify(args) -> int:
                                 password=args.password, domain=args.domain)
         elif args.proto == "dns":
             report = verify_dns(args.host, args.port, zone=args.zone)
+        elif args.proto == "ssh":
+            report = verify_ssh(args.host, args.port)
         elif args.proto == "ldap":
             from urllib.parse import urlparse
 

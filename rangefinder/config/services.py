@@ -120,6 +120,19 @@ class SshConfig(ServiceBase):
     # reject everything (capture only).
     accept_creds: dict[str, str] = Field(default_factory=dict)
     motd: str = ""
+    # Crypto + auth posture (FAIL-CLOSED). asyncssh advertises its own modern algorithm set by
+    # default, which would hide a real host's weak KEX/cipher/MAC/host-key exposure and mismatch
+    # its ssh-audit fingerprint. Capture measures the real host's KEXINIT name-lists and auth
+    # methods and pins them here so the twin reproduces the exact posture. None = asyncssh's modern
+    # defaults (fail-closed: never fabricate a weak-algorithm finding on an unmeasured host).
+    kex_algs: list[str] | None = None
+    encryption_algs: list[str] | None = None  # symmetric ciphers
+    mac_algs: list[str] | None = None
+    host_key_algs: list[str] | None = None  # server host-key/signature algorithms
+    # SSH auth methods the server offers (e.g. ["publickey", "password"]). Gates which auth the
+    # twin accepts/challenges. None = offer password + publickey (the capture-friendly default for
+    # authored ranges); a credentialed capture pins the measured set.
+    auth_methods: list[str] | None = None
 
 
 class BannerConfig(ServiceBase):
