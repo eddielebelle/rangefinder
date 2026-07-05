@@ -103,6 +103,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cap_ssh.add_argument("--host-id", default=None)
     p_cap_ssh.add_argument("--scrub", action="store_true", help="(no-op for ssh; posture holds no secrets)")
 
+    # Every captor can fold its result straight into an existing range (grow an estate in one step
+    # instead of capture-to-temp then merge). Added once across all capture subparsers.
+    for _cap in capture_sub.choices.values():
+        _cap.add_argument("--append", type=Path, default=None,
+                          help="merge this capture into an existing range config (grow an estate); "
+                               "writes back to that file unless -o is given")
+
     p_score = sub.add_parser("score", help="score objectives against a telemetry log")
     p_score.add_argument("config", type=Path)
     p_score.add_argument("log", help="telemetry JSONL file, or - for stdin")
@@ -328,26 +335,124 @@ def cmd_capture(args) -> int:
         return EXIT_ERROR
 
     config = _capture_config(service, hostname, args, warnings, default_id)
+
+    # --append folds this capture into an existing range and grows it in place (output defaults back
+    # to the range file). Reconciliation lines the fresh capture up with the estate first (a host
+    # captured by address unions onto its existing entry; a re-captured service refreshes rather
+    # than collides), keeping the estate's own subnet.
+    out_path = args.out
+    coherence_md: str | None = None
+    if args.append:
+        from rangefinder.orchestrate.merge import _PLACEHOLDER_IP, merge_configs
+
+        try:
+            existing = load_config(args.append)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_CONFIG
+        existing_dump = existing.model_dump(mode="json", exclude_none=True)
+        _reconcile_append(existing_dump, config, _PLACEHOLDER_IP, warnings)
+        try:
+            config, append_warnings = merge_configs(
+                [existing_dump, config], name=args.name, subnet=str(existing.network.subnet))
+        except ValueError as exc:
+            print(f"error: append failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        warnings += append_warnings
+        if out_path is None:
+            out_path = args.append  # grow the range file in place
+
     try:
-        RangeConfig.model_validate(config)
+        model = RangeConfig.model_validate(config)
     except Exception as exc:
         print(f"error: captured config is invalid: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    _emit_config(json.dumps(config, indent=2) + "\n", args.out)
+    _emit_config(json.dumps(config, indent=2) + "\n", out_path)
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
 
+    # Appending makes services coexist, so surface cross-service coherence (advisory, as `merge`).
+    if args.append:
+        from rangefinder.coherence import check_coherence, format_report
+
+        coh = check_coherence(model)
+        if coh.has_findings:
+            coherence_md = format_report(coh)
+            print("cross-service coherence:", file=sys.stderr)
+            print(coherence_md, file=sys.stderr)
+
     # Provenance sidecar: what the twin reproduces from measurement vs. fail-closed assumption
     # vs. what can't be measured at this access level. Kept out of the config so the config stays
-    # clean and editable; written next to it (and always printed) so assumptions can't hide.
+    # clean and editable; written next to it (and always printed) so assumptions can't hide. On
+    # --append it grows the existing sidecar so earlier captures' provenance is preserved.
     if capture_report is not None:
         _print_capture_report(capture_report)
-        if args.out:
-            sidecar = Path(args.out).with_suffix(".capture-report.md")
-            sidecar.write_text(capture_report.to_markdown(), encoding="utf-8")
+        if out_path:
+            sidecar = Path(out_path).with_suffix(".capture-report.md")
+            new_md = capture_report.to_markdown()
+            if args.append:
+                new_md = _grow_capture_report(
+                    args.append, new_md, f"{hostname} ({args.captor})", coherence_md)
+            sidecar.write_text(new_md, encoding="utf-8")
             print(f"wrote {sidecar}", file=sys.stderr)
     return EXIT_OK
+
+
+def _reconcile_append(existing_dump, new_config, placeholder_ip, warnings) -> None:
+    """Align a fresh single-service capture with the estate before merging, in place.
+
+    - **Union by measured IP:** if the capture's real (non-placeholder) address matches a host the
+      estate already has under a different id, adopt that id so the host isn't duplicated and its
+      measured IP isn't reallocated.
+    - **Refresh, don't collide:** if the target host already carries the *same* service (type+port),
+      drop the stale copy so the newer capture replaces it. A *different* service on that port is a
+      genuine conflict and is left for merge to fail closed on.
+    """
+    new_host = new_config["hosts"][0]
+    new_svc = new_host["services"][0]
+    hosts = existing_dump["hosts"]
+
+    target = next((h for h in hosts if h["id"] == new_host["id"]), None)
+    if target is None and new_host["ip"] != placeholder_ip:
+        for h in hosts:
+            if h["ip"] == new_host["ip"]:
+                target = h
+                new_host["id"] = h["id"]
+                warnings.append(f"append: {new_host['ip']} matches existing host {h['id']!r}; "
+                                f"unioning onto it (pass --host-id to override)")
+                break
+
+    if target is not None:
+        kept = []
+        for s in target["services"]:
+            if s["port"] == new_svc["port"] and s.get("type") == new_svc.get("type"):
+                warnings.append(f"append: refreshed {s.get('type')} on "
+                                f"{target['id']}:{s['port']} with the new capture")
+            else:
+                kept.append(s)
+        target["services"] = kept
+
+
+def _grow_capture_report(append_path, new_md: str, label: str, coherence_md=None) -> str:
+    """Grow the existing range's provenance sidecar with a fresh capture (and any coherence findings).
+
+    If the estate has no prior sidecar its existing hosts' provenance is unrecorded — say so
+    explicitly rather than let a one-service report masquerade as the whole estate's provenance.
+    """
+    existing_sidecar = Path(append_path).with_suffix(".capture-report.md")
+    parts: list[str] = []
+    prior = existing_sidecar.read_text(encoding="utf-8").strip() if existing_sidecar.exists() else ""
+    if prior:
+        parts.append(prior)
+    else:
+        parts.append("# Base range provenance not recorded\n\n_The range this capture was appended "
+                     "to has no capture-report sidecar, so provenance for its existing hosts is "
+                     "unknown (hand-authored, or captured without -o)._")
+    parts.append(f"# appended: {label}\n\n{new_md.strip()}")
+    if coherence_md:
+        parts.append(f"# Cross-service coherence\n\n```\n{coherence_md}\n```")
+    return "\n\n---\n\n".join(p for p in parts if p.strip()) + "\n"
 
 
 def _emit_config(text: str, out) -> None:
@@ -387,7 +492,10 @@ def _capture_config(service, hostname, args, warnings, default_id) -> dict:
 
     from rangefinder.config.model import SCHEMA_VERSION
 
-    host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.split(".")[0].lower()).strip("-") or default_id)
+    # Derive the id from the *full* hostname (dots -> hyphens), not just the first label: two
+    # distinct hosts sharing a leading label (web.corp.com vs web.dev.com) must get distinct ids so
+    # `merge`/`--append` don't collapse them, while repeat captures of one host share an id and union.
+    host_id = args.host_id or (re.sub(r"[^a-z0-9-]", "-", hostname.lower()).strip("-") or default_id)
     name = re.sub(r"[^a-z0-9_-]", "-", (args.name or hostname).lower()).strip("-_") or "captured"
     return {
         "name": name[:62],

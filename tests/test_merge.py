@@ -219,6 +219,120 @@ def test_empty_input_rejected():
         merge_configs([])
 
 
+# --------------------------------------------------------------- capture --append semantics
+
+def test_append_adds_host_within_existing_subnet():
+    # How `capture --append` calls merge: existing estate first, fresh single-service capture
+    # second, pinned to the estate's own subnet.
+    estate = cfg("corp", "dc", "10.20.0.10", svc("ldap", 389), subnet="10.20.0.0/24")
+    fresh = cfg("box", "web", "10.99.0.10", svc("http", 80))  # placeholder-IP capture
+    merged, _ = merge_configs([estate, fresh], subnet="10.20.0.0/24")
+
+    model = _validate(merged)
+    assert merged["name"] == "corp"                       # estate name kept
+    assert str(model.network.subnet) == "10.20.0.0/24"    # estate subnet kept
+    ids = {h.id: str(h.ip) for h in model.hosts}
+    assert ids["dc"] == "10.20.0.10"                       # existing host pinned
+    assert ids["web"].startswith("10.20.0.")              # new host allocated into the estate
+
+
+def test_append_same_host_id_adds_service_to_that_host():
+    estate = cfg("corp", "dc", "10.20.0.10", svc("ldap", 389), subnet="10.20.0.0/24")
+    fresh = cfg("box", "dc", "10.20.0.10", svc("kerberos", 88), subnet="10.20.0.0/24")
+    merged, _ = merge_configs([estate, fresh], subnet="10.20.0.0/24")
+    model = _validate(merged)
+    assert len(model.hosts) == 1
+    assert {s.port for s in model.hosts[0].services} == {389, 88}
+
+
+def test_grow_capture_report(tmp_path):
+    from rangefinder.cli import _grow_capture_report
+
+    estate = tmp_path / "estate.json"
+    estate.write_text("{}")
+    (tmp_path / "estate.capture-report.md").write_text("## dc ldap\n- measured: anon bind")
+
+    grown = _grow_capture_report(estate, "## web http\n- measured: TRACE", "web (http)")
+    assert "measured: anon bind" in grown   # prior provenance preserved
+    assert "appended: web (http)" in grown   # new section labelled
+    assert "measured: TRACE" in grown
+
+
+def test_grow_capture_report_without_existing_sidecar(tmp_path):
+    from rangefinder.cli import _grow_capture_report
+
+    estate = tmp_path / "estate.json"  # no sibling sidecar
+    grown = _grow_capture_report(estate, "## web http\n- measured: TRACE", "web (http)")
+    assert "appended: web (http)" in grown
+    assert "measured: TRACE" in grown
+    assert "provenance not recorded" in grown  # base hosts' provenance flagged as unknown
+
+
+def test_grow_capture_report_folds_in_coherence(tmp_path):
+    from rangefinder.cli import _grow_capture_report
+
+    estate = tmp_path / "estate.json"
+    (tmp_path / "estate.capture-report.md").write_text("## dc\n- measured: x")
+    grown = _grow_capture_report(estate, "## web\n- measured: y", "web (http)",
+                                 "‼ possible-leak [secret#abcd1234]: ...")
+    assert "Cross-service coherence" in grown
+    assert "possible-leak" in grown
+
+
+# --------------------------------------------------------------- --append reconciliation
+
+def _estate(host_dict):
+    return {"name": "corp", "schema_version": 3, "network": {"subnet": "10.0.0.0/24"},
+            "hosts": [host_dict]}
+
+
+def _new(host_id, ip, service):
+    return {"name": "cap", "network": {"subnet": "10.0.0.0/24"},
+            "hosts": [{"id": host_id, "hostname": host_id, "ip": ip,
+                       "os": "generic_linux", "services": [service]}]}
+
+
+def test_reconcile_refreshes_same_service():
+    from rangefinder.cli import _reconcile_append
+
+    existing = _estate({"id": "web", "hostname": "web", "ip": "10.0.0.10",
+                        "os": "generic_linux", "services": [svc("http", 80, server_header="old")]})
+    new = _new("web", "10.0.0.10", svc("http", 80, server_header="new"))
+    warnings = []
+    _reconcile_append(existing, new, "10.99.0.10", warnings)
+    assert existing["hosts"][0]["services"] == []          # stale copy dropped
+    assert any("refreshed" in w for w in warnings)
+    merged, _ = merge_configs([existing, new])
+    assert _validate(merged).hosts[0].services[0].server_header == "new"  # newer capture wins
+
+
+def test_reconcile_unions_host_captured_by_ip():
+    from rangefinder.cli import _reconcile_append
+
+    existing = _estate({"id": "dc", "hostname": "dc.corp", "ip": "10.0.0.10",
+                        "os": "generic_linux", "services": [svc("ldap", 389)]})
+    new = _new("10-0-0-10", "10.0.0.10", svc("ssh", 22))  # captured by address -> IP-derived id
+    warnings = []
+    _reconcile_append(existing, new, "10.99.0.10", warnings)
+    assert new["hosts"][0]["id"] == "dc"                    # adopted the existing host's id
+    assert any("unioning onto it" in w for w in warnings)
+    model = _validate(merge_configs([existing, new])[0])
+    assert len(model.hosts) == 1
+    assert {s.port for s in model.hosts[0].services} == {389, 22}
+
+
+def test_reconcile_leaves_real_conflict_for_merge_to_fail_closed():
+    from rangefinder.cli import _reconcile_append
+
+    existing = _estate({"id": "web", "hostname": "web", "ip": "10.0.0.10",
+                        "os": "generic_linux", "services": [svc("http", 80)]})
+    new = _new("web", "10.0.0.10", svc("banner", 80, protocol="redis"))  # different service, same port
+    _reconcile_append(existing, new, "10.99.0.10", [])
+    assert existing["hosts"][0]["services"]                 # NOT dropped — it's a genuine conflict
+    with pytest.raises(ValueError, match="different services on port 80"):
+        merge_configs([existing, new])
+
+
 # --------------------------------------------------------------- provenance stitching (CLI)
 
 def test_combined_report_notes_missing_sidecar(tmp_path):
