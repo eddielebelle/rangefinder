@@ -351,8 +351,8 @@ def verify_smb(host: str, port: int = 445, *, username: str = "", password: str 
                domain: str = "", timeout: float = 5.0) -> VerifyReport:
     from rangefinder.capture.smb import capture_smb
 
-    service, warnings = capture_smb(host, port, username=username, password=password,
-                                    domain=domain, timeout=timeout, scrub=False)
+    service, warnings, _ = capture_smb(host, port, username=username, password=password,
+                                       domain=domain, timeout=timeout, scrub=False)
     report = VerifyReport("smb", f"{host}:{port}", warnings=list(warnings))
     real_raw = {s["name"]: s.get("files", {}) for s in service.get("shares", [])}
 
@@ -382,6 +382,21 @@ def verify_smb(host: str, port: int = 445, *, username: str = "", password: str 
         if key not in real:
             report.divergences.append(Divergence(key, "extra", "share only on replica"))
 
+    # Posture diff: the twin must reproduce the measured security posture, not just the files.
+    # Each field the capture measured on the real host is re-measured on the replica (both go
+    # through the same capture_smb probes) and asserted equal — so guest-fallback, SMB1, signing
+    # and dialect stay locked and can't silently regress into a false finding.
+    for f in ("server_os", "signing_required", "smb1_enabled", "reject_unknown_users", "max_dialect"):
+        if f not in service:
+            continue
+        report.total += 1
+        rv, pv = service.get(f), repl_service.get(f)
+        if rv == pv:
+            report.matched += 1
+        else:
+            report.divergences.append(
+                Divergence(f"posture:{f}", "posture", f"real {rv!r} vs replica {pv!r}"))
+
     if set(real_raw) != set(repl_raw) and set(real) == set(repl):
         report.boundary.append(
             "share/path names compared case-insensitively (SMB is case-insensitive); the "
@@ -400,8 +415,8 @@ def _recapture_smb(host, port, username, password, domain, timeout, attempts: in
     last: Exception | None = None
     for _ in range(attempts):
         try:
-            service, _ = capture_smb(host, port, username=username, password=password,
-                                     domain=domain, timeout=timeout, scrub=False)
+            service, _, _ = capture_smb(host, port, username=username, password=password,
+                                        domain=domain, timeout=timeout, scrub=False)
             return service
         except Exception as exc:  # impacket raises many types on a not-yet-ready listener
             last = exc

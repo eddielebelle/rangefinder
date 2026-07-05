@@ -47,7 +47,7 @@ async def _capture(scrub=False):
 
 
 def test_capture_records_shares_and_files():
-    service, warnings = asyncio.run(_capture())
+    service, warnings, _ = asyncio.run(_capture())
     assert service["type"] == "smb"
     shares = {s["name"].upper(): s for s in service["shares"]}
     # IPC$ is skipped; the real shares are captured
@@ -62,7 +62,7 @@ def test_capture_records_shares_and_files():
 def test_captured_smb_replays(tmp_path):
     from dataclasses import replace as dc_replace
 
-    service, _ = asyncio.run(_capture())
+    service, *_ = asyncio.run(_capture())
     # Build a fresh facade from the captured shares and confirm the file tree materializes.
     ctx, _ = make_ctx()
     ctx = dc_replace(ctx, config_dir=str(tmp_path))
@@ -79,7 +79,7 @@ def test_captured_smb_replays(tmp_path):
         finally:
             await replica.stop()
 
-    recaptured, _ = asyncio.run(run())
+    recaptured, *_ = asyncio.run(run())
     names = {s["name"].upper() for s in recaptured["shares"]}
     assert {"PUBLIC", "IT"} <= names
 
@@ -104,7 +104,7 @@ def _capture_with(**kw):
 
 
 def test_share_filter_targets_named_shares():
-    service, warnings = _capture_with(shares=["IT", "does-not-exist"])
+    service, warnings, _ = _capture_with(shares=["IT", "does-not-exist"])
     names = {s["name"].upper() for s in service["shares"]}
     assert names == {"IT"}  # Public skipped; only IT captured
     assert any("does-not-exist" in w and "not found" in w for w in warnings)
@@ -112,7 +112,7 @@ def test_share_filter_targets_named_shares():
 
 def test_per_share_budget_does_not_starve_other_shares():
     # IT has 2 files; a per-share cap of 1 truncates IT but must NOT starve Public.
-    service, warnings = _capture_with(max_files_per_share=1)
+    service, warnings, _ = _capture_with(max_files_per_share=1)
     shares = {s["name"].upper(): s for s in service["shares"]}
     assert "PUBLIC" in shares and "IT" in shares
     assert len(shares["IT"].get("files", {})) == 1          # IT truncated to the per-share cap
@@ -144,7 +144,7 @@ def test_capture_records_restrict_anonymous_for_denied_share():
         finally:
             await facade.stop()
 
-    service, warnings = asyncio.run(run())
+    service, warnings, report = asyncio.run(run())
     shares = {s["name"].upper(): s for s in service["shares"]}
     assert shares["PRIVATE"].get("restrict_anonymous") is True   # denial recorded faithfully
     assert "files" not in shares["PRIVATE"]                      # nothing readable captured
@@ -152,9 +152,18 @@ def test_capture_records_restrict_anonymous_for_denied_share():
     assert "signing_required" in service                         # signing posture captured
     assert any("private" in w.lower() and "access denied" in w for w in warnings)
 
+    # provenance report: posture is measured, and the anonymous-perspective gap is surfaced
+    status = {i.field: i.status for i in report.items}
+    assert status.get("smb1_enabled") == "measured"
+    assert status.get("reject_unknown_users") == "measured"
+    assert status.get("signing_required") == "measured"
+    assert any(i.status == "unmeasurable" and "authenticated" in i.field for i in report.items)
+    md = report.to_markdown()
+    assert "MEASURED" in md and "UNMEASURABLE" in md
+
 
 def test_scrub_redacts_file_contents():
-    service, _ = asyncio.run(_capture(scrub=True))
+    service, *_ = asyncio.run(_capture(scrub=True))
     it = next(s for s in service["shares"] if s["name"] == "IT")
     vault = it["files"]["creds/vault.txt"]
     # the "sql:" credential line has no keyword our redactor keys on, but a password= would

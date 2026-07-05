@@ -20,11 +20,81 @@ without bloating the config. ``scrub=True`` redacts secrets in captured text.
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass, field
 
 from rangefinder.capture.scrub import Scrubber
 
 # Shares that are administrative / non-file — skip (a null session can't read them anyway).
 _SKIP_SHARES = {"IPC$", "ADMIN$", "PRINT$"}
+
+# SMB2 dialect wire value -> config string (0x0302 has no config literal; map down to 3.0).
+_DIALECT_NAME = {0x0202: "2.0.2", 0x0210: "2.1", 0x0300: "3.0", 0x0302: "3.0", 0x0311: "3.1.1"}
+
+# Fixed, obviously-fake identity for the unknown-user probe (a hardened host rejects it; a
+# guest-mapping host accepts it). No randomness needed — the point is that it does not exist.
+_PROBE_USER = "rangefinder_probe"
+_PROBE_PASS = "rf-not-a-real-password"
+
+
+@dataclass
+class PostureItem:
+    """One security-relevant fact about the captured host, with its provenance.
+
+    status is the confidence tier the capture report groups by:
+      measured      — actively probed against the real host; captured truth that transfers.
+      assumed       — could not measure; the facade uses a FAIL-CLOSED default and says so here.
+      unmeasurable  — the answer only exists from an access level the capture did not have
+                      (e.g. an authenticated read when captured anonymously); needs a decision.
+    """
+
+    field: str
+    status: str
+    value: str
+    note: str = ""
+
+
+@dataclass
+class CaptureReport:
+    """Provenance for a capture: which posture facts are measured vs assumed vs unmeasurable.
+
+    Written alongside the config as a ``*.capture-report.md`` sidecar so a reviewer can see
+    exactly what the twin reproduces from measurement and what it merely assumes.
+    """
+
+    target: str
+    perspective: str
+    items: list[PostureItem] = field(default_factory=list)
+
+    def _tier(self, status: str) -> list[PostureItem]:
+        return [i for i in self.items if i.status == status]
+
+    def to_markdown(self) -> str:
+        lines = [f"# Capture report — {self.target}",
+                 f"_Perspective: {self.perspective}_", ""]
+        tiers = [
+            ("✓ MEASURED", "measured",
+             "captured truth — transfers to the real host"),
+            ("⚠ ASSUMED", "assumed",
+             "could not measure — fail-closed default in use; CONFIRM against the real host"),
+            ("✗ UNMEASURABLE at this access level", "unmeasurable",
+             "no default can be right — decide, or re-capture with the access level named"),
+        ]
+        for title, status, blurb in tiers:
+            items = self._tier(status)
+            lines.append(f"## {title}")
+            lines.append(f"_{blurb}_")
+            if not items:
+                lines.append("\n- (none)\n")
+                continue
+            lines.append("")
+            width = max(len(i.field) for i in items)
+            for i in items:
+                row = f"- `{i.field.ljust(width)}`  {i.value}"
+                if i.note:
+                    row += f"  — {i.note}"
+                lines.append(row)
+            lines.append("")
+        return "\n".join(lines)
 
 
 def capture_smb(
@@ -40,13 +110,18 @@ def capture_smb(
     shares: list[str] | None = None,
     max_file_size: int = 65_536,
     scrub: bool = False,
-) -> tuple[dict, list[str]]:
-    """Enumerate shares/files and return (smb_service_config, warnings).
+) -> tuple[dict, list[str], CaptureReport]:
+    """Enumerate shares/files and return (smb_service_config, warnings, capture_report).
 
     The file budget is **per share** (``max_files_per_share``) so one large share (a media
     library, say) can't starve the rest; ``max_files`` is an overall safety ceiling. ``shares``
     restricts the capture to named shares (case-insensitive) — target the ones that matter and
     skip media/photo shares that are all placeholders anyway.
+
+    The capture also actively probes the host's security *posture* (SMB1 availability, whether
+    unknown accounts are rejected, signing, dialect) and records each with its provenance in the
+    returned :class:`CaptureReport` — so the twin reproduces measured behaviour and the reviewer
+    sees exactly which fields are measured vs. fail-closed assumptions.
     """
     from impacket.smbconnection import SMBConnection, SessionError
     from impacket.nt_errors import STATUS_ACCESS_DENIED
@@ -55,14 +130,52 @@ def capture_smb(
     scrubber = Scrubber() if scrub else None
     want = {s.strip().lower() for s in shares} if shares else None
     anonymous = not username  # null session: denials become restrict_anonymous, not empty shares
+    perspective = "anonymous / null session" if anonymous else f"authenticated as {username!r}"
+    report = CaptureReport(target=host, perspective=perspective)
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)
         server_os = conn.getServerOS() or "Windows"
+        report.items.append(PostureItem("server_os", "measured", server_os))
+
+        # --- security posture: measure, else fail closed and say so -----------------
         try:
             signing_required = bool(conn.isSigningRequired())
+            report.items.append(PostureItem(
+                "signing_required", "measured", str(signing_required).lower(),
+                "negotiate SecurityMode"))
         except Exception:
-            signing_required = False
+            signing_required = True  # fail closed: claim required rather than invent an exposure
+            report.items.append(PostureItem(
+                "signing_required", "assumed", "true", "could not read negotiate; assumed required"))
+
+        dialect = conn.getDialect()
+        max_dialect = _DIALECT_NAME.get(dialect)
+        if max_dialect:
+            report.items.append(PostureItem("max_dialect", "measured", max_dialect, "negotiated"))
+        else:
+            max_dialect = "3.1.1"
+            report.items.append(PostureItem(
+                "max_dialect", "assumed", max_dialect,
+                f"negotiated dialect {dialect!r} has no config mapping; assumed modern"))
+
+        smb1_enabled = _probe_smb1(host, port, timeout)
+        report.items.append(PostureItem(
+            "smb1_enabled", "measured", str(smb1_enabled).lower(),
+            "NT LM 0.12 negotiate " + ("answered" if smb1_enabled else "refused")))
+
+        reject = _probe_reject_unknown(host, port, timeout, domain)
+        if reject is None:
+            reject_unknown_users = True  # fail closed: reject rather than fabricate a guest bypass
+            report.items.append(PostureItem(
+                "reject_unknown_users", "assumed", "true",
+                "unknown-user probe inconclusive; assumed hardened"))
+        else:
+            reject_unknown_users = reject
+            report.items.append(PostureItem(
+                "reject_unknown_users", "measured", str(reject).lower(),
+                "bogus login " + ("rejected" if reject else "accepted as guest")))
+
         shares_cfg: list[dict] = []
         overall = _Budget(max_files)
         seen: set[str] = set()
@@ -117,10 +230,66 @@ def capture_smb(
             pass
 
     service: dict = {"type": "smb", "port": port, "server_os": server_os,
-                     "signing_required": signing_required, "shares": shares_cfg}
+                     "signing_required": signing_required, "smb1_enabled": smb1_enabled,
+                     "reject_unknown_users": reject_unknown_users, "max_dialect": max_dialect,
+                     "shares": shares_cfg}
     total = sum(len(s.get("files", {})) for s in shares_cfg)
+
+    # Share access is a measured fact: names enumerated, how many refused this session, how many
+    # yielded files. The report states it so "empty share" vs "denied share" is never ambiguous.
+    n_restricted = sum(1 for s in shares_cfg if s.get("restrict_anonymous"))
+    n_withfiles = sum(1 for s in shares_cfg if s.get("files"))
+    report.items.append(PostureItem(
+        "shares", "measured", f"{len(shares_cfg)} enumerable",
+        f"{n_restricted} deny this session, {n_withfiles} readable ({total} file(s))"))
+
+    # The authenticated surface is unknowable from an anonymous capture — no default is right.
+    if anonymous:
+        report.items.append(PostureItem(
+            "authenticated_read_write", "unmeasurable", "unknown",
+            "captured anonymously; what a valid user can read/write was not measured. "
+            "Re-capture with -u/-p to measure, or the twin presents these shares as deny-all."))
+
     warnings.append(f"captured {len(shares_cfg)} share(s), {total} file(s) from {host}")
-    return service, warnings
+    return service, warnings, report
+
+
+def _probe_smb1(host: str, port: int, timeout: float) -> bool:
+    """True if the host answers a legacy SMB1 (NT LM 0.12) negotiate, else False.
+
+    Forces an SMB1-only negotiate on a fresh connection. A modern host with SMB1 disabled
+    refuses it (negotiate/parse/logon failure) -> False. The main capture already proved TCP
+    reachability, so a failure here is a genuine SMB1 refusal, not a transport blip.
+    """
+    from impacket.smbconnection import SMBConnection
+
+    try:
+        c = SMBConnection(host, host, sess_port=port, timeout=timeout, preferredDialect="NT LM 0.12")
+        c.login("", "")
+        c.close()
+        return True
+    except Exception:
+        return False
+
+
+def _probe_reject_unknown(host: str, port: int, timeout: float, domain: str) -> bool | None:
+    """Does the host reject an unknown account (vs. mapping any credential to guest)?
+
+    Returns True (rejects unknown — hardened), False (accepted a bogus login — guest fallback),
+    or None if inconclusive (some other status), in which case the caller fails closed.
+    """
+    from impacket.nt_errors import STATUS_LOGON_FAILURE
+    from impacket.smbconnection import SMBConnection, SessionError
+
+    try:
+        c = SMBConnection(host, host, sess_port=port, timeout=timeout)
+        c.login(_PROBE_USER, _PROBE_PASS, domain)
+        c.close()
+        return False  # a non-existent account "authenticated" -> unknown users are guest-mapped
+    except SessionError as exc:
+        return True if exc.getErrorCode() == STATUS_LOGON_FAILURE else None
+    except Exception:
+        return None
 
 
 class _Budget:

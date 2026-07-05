@@ -109,8 +109,11 @@ def test_verify_smb_round_trip():
     with _ServedFacade(service) as srv:
         report = verify_smb("127.0.0.1", srv.port)
 
-    assert report.total == 1, report.warnings
+    # 1 share dimension + the security-posture fields, all faithful on the round-trip.
+    assert report.total >= 2, report.warnings
     assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    # the posture (signing/smb1/guest/dialect) is diffed too, and round-trips with no divergence
+    assert not any(d.kind == "posture" for d in report.divergences)
     assert any("null-session" in b for b in report.boundary)
 
 

@@ -217,6 +217,8 @@ def cmd_gen(args) -> int:
 def cmd_capture(args) -> int:
     from urllib.parse import urlparse
 
+    capture_report = None  # only the smb captor produces a posture report today
+
     if args.captor == "http":
         from rangefinder.capture import capture_http
 
@@ -250,7 +252,7 @@ def cmd_capture(args) -> int:
         hostname = args.host
         try:
             share_filter = [s for s in (args.shares or "").split(",") if s.strip()] or None
-            service, warnings = capture_smb(
+            service, warnings, capture_report = capture_smb(
                 hostname, args.port, username=args.username,
                 password=args.password, domain=args.domain, scrub=args.scrub,
                 max_files_per_share=args.max_files_per_share, shares=share_filter,
@@ -288,7 +290,31 @@ def cmd_capture(args) -> int:
         sys.stdout.write(text)
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
+
+    # Provenance sidecar: what the twin reproduces from measurement vs. fail-closed assumption
+    # vs. what can't be measured at this access level. Kept out of the config so the config stays
+    # clean and editable; written next to it (and always printed) so assumptions can't hide.
+    if capture_report is not None:
+        _print_capture_report(capture_report)
+        if args.out:
+            sidecar = Path(args.out).with_suffix(".capture-report.md")
+            sidecar.write_text(capture_report.to_markdown(), encoding="utf-8")
+            print(f"wrote {sidecar}", file=sys.stderr)
     return EXIT_OK
+
+
+def _print_capture_report(report) -> None:
+    """Print a compact posture summary to stderr: the ⚠ assumed and ✗ unmeasurable lines are the
+    ones a reviewer must act on, so surface counts and list those two tiers explicitly."""
+    tiers = {t: [i for i in report.items if i.status == t]
+             for t in ("measured", "assumed", "unmeasurable")}
+    print(f"posture ({report.perspective}): "
+          f"{len(tiers['measured'])} measured, {len(tiers['assumed'])} assumed, "
+          f"{len(tiers['unmeasurable'])} unmeasurable", file=sys.stderr)
+    for tier, mark in (("assumed", "⚠ assumed"), ("unmeasurable", "✗ unmeasurable")):
+        for i in tiers[tier]:
+            note = f" — {i.note}" if i.note else ""
+            print(f"  {mark}: {i.field} = {i.value}{note}", file=sys.stderr)
 
 
 def _capture_config(service, hostname, args, warnings, default_id) -> dict:
