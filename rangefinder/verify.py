@@ -319,11 +319,22 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
     return report
 
 
+# Live operational attributes a real directory recomputes on every request — the facade
+# regenerates them per query by design (e.g. RootDSE currentTime, injected fresh in the ldap
+# facade), so their value is *expected* to differ between the capture read and the replica read.
+# Comparing them is a guaranteed intermittent false divergence; exclude by name (case-insensitive).
+_EPHEMERAL_LDAP_ATTRS = frozenset({"currenttime"})
+
+
 def _diff_attrs(real: dict, repl: dict) -> str:
     # Operational attributes the facade synthesises for a valid RootDSE/entry are allowed to
-    # appear on the replica; we only flag captured attributes that fail to reproduce.
+    # appear on the replica; we only flag captured attributes that fail to reproduce. Live
+    # operational attributes (see _EPHEMERAL_LDAP_ATTRS) are skipped — a differing value there
+    # is faithful behaviour, not a fidelity gap.
     problems: list[str] = []
     for name, vals in real.items():
+        if name.lower() in _EPHEMERAL_LDAP_ATTRS:
+            continue
         if name not in repl:
             problems.append(f"-{name}")
         elif set(vals) != set(repl[name]):

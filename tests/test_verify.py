@@ -82,6 +82,21 @@ def test_verify_ldap_round_trip():
     assert any("anonymous" in b for b in report.boundary)
 
 
+def test_diff_attrs_ignores_live_operational_attributes():
+    """RootDSE currentTime is regenerated live per query by design, so its value is *expected*
+    to differ between the capture read and the replica read. _diff_attrs must not flag it (the
+    intermittent flake this guards against), while still catching a real attribute that diverges."""
+    from rangefinder.verify import _diff_attrs
+
+    real = {"namingContexts": ["dc=acme,dc=corp"], "currentTime": ["20260705053746.0Z"]}
+    repl = {"namingContexts": ["dc=acme,dc=corp"], "currentTime": ["20260705053751.0Z"]}
+    assert _diff_attrs(real, repl) == ""  # only currentTime differs -> not a divergence
+
+    # a genuinely divergent captured attribute is still reported
+    repl_bad = {"namingContexts": ["dc=evil,dc=corp"], "currentTime": ["20260705053751.0Z"]}
+    assert "~namingContexts" in _diff_attrs(real, repl_bad)
+
+
 def test_verify_smb_round_trip():
     service = {
         "type": "smb", "port": 445, "server_os": "Windows Server 2022",
