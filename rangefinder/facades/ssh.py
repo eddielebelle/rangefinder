@@ -48,8 +48,27 @@ class SshFacade(Facade):
         import asyncssh
 
         logging.getLogger("asyncssh").setLevel(logging.CRITICAL)
-        self._host_key = asyncssh.generate_private_key("ssh-ed25519")
+        # Host keys of the captured type(s) — the key type is what determines the host-key
+        # algorithms advertised in KEXINIT (a real host on ssh-rsa reads as ssh-rsa, not ed25519).
+        host_keys = _host_keys(self.cfg.host_key_algs)
+        self._host_key = host_keys[0]
         server_version = self.cfg.server_version.removeprefix("SSH-2.0-")
+
+        # Reproduce the captured algorithm posture where measured; asyncssh's modern defaults stand
+        # in (fail-closed) where it wasn't. Each captured list is filtered to what asyncssh can
+        # actually serve — dropping KEXINIT extension markers (ext-info-s, kex-strict-*) and any
+        # algorithm asyncssh doesn't implement (fail-closed: under-advertise, never crash/fabricate).
+        alg_kwargs: dict = {}
+        for cfg_list, kind, kwarg in (
+            (self.cfg.kex_algs, "kex", "kex_algs"),
+            (self.cfg.encryption_algs, "encryption", "encryption_algs"),
+            (self.cfg.mac_algs, "mac", "mac_algs"),
+            (self.cfg.host_key_algs, "sig", "signature_algs"),
+        ):
+            if cfg_list:
+                algs = _serviceable(kind, cfg_list)
+                if algs:
+                    alg_kwargs[kwarg] = algs
 
         # Subclass asyncssh.SSHServer lazily (kept out of module import so the CLI does
         # not pay the asyncssh import unless an SSH host actually runs).
@@ -59,10 +78,11 @@ class SshFacade(Facade):
             self.bind_host,
             self.port,
             server_factory=server_factory,
-            server_host_keys=[self._host_key],
+            server_host_keys=host_keys,
             server_version=server_version,
             process_factory=self._shell,
             login_timeout=20,
+            **alg_kwargs,
         )
         self.ctx.emitter.emit(ev.service_listen(self))
 
@@ -130,6 +150,57 @@ class SshFacade(Facade):
         process.exit(0)
 
 
+# Host-key / signature algorithm -> the asyncssh key type whose presence advertises it. Multiple
+# algorithms (ssh-rsa / rsa-sha2-*) map to one key; we generate one key per distinct type.
+_HOSTKEY_TYPE = {
+    "ssh-ed25519": "ssh-ed25519",
+    "ssh-rsa": "ssh-rsa", "rsa-sha2-256": "ssh-rsa", "rsa-sha2-512": "ssh-rsa",
+    "ecdsa-sha2-nistp256": "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384": "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521": "ecdsa-sha2-nistp521",
+    "ssh-dss": "ssh-dss",
+}
+
+
+def _serviceable(kind: str, algs: list[str]) -> list[str]:
+    """Keep only algorithms asyncssh can serve, preserving order. Drops KEXINIT extension markers
+    (ext-info-s, kex-strict-*) and anything asyncssh doesn't implement."""
+    import asyncssh.encryption
+    import asyncssh.kex
+    import asyncssh.mac
+    import asyncssh.public_key
+
+    getter = {
+        "kex": asyncssh.kex.get_kex_algs,
+        "encryption": asyncssh.encryption.get_encryption_algs,
+        "mac": asyncssh.mac.get_mac_algs,
+        "sig": asyncssh.public_key.get_public_key_algs,
+    }[kind]
+    ok = {a.decode() if isinstance(a, bytes) else a for a in getter()}
+    return [a for a in algs if a in ok]
+
+
+def _host_keys(host_key_algs: list[str] | None):
+    """Generate host keys matching the captured host-key algorithms (ed25519 by default). The key
+    *type* is what makes asyncssh advertise that host-key algorithm in KEXINIT."""
+    import asyncssh
+
+    if not host_key_algs:
+        return [asyncssh.generate_private_key("ssh-ed25519")]
+    keytypes: list[str] = []
+    for alg in host_key_algs:
+        kt = _HOSTKEY_TYPE.get(alg)
+        if kt and kt not in keytypes:
+            keytypes.append(kt)
+    keys = []
+    for kt in keytypes:
+        try:
+            keys.append(asyncssh.generate_private_key(kt))
+        except Exception:
+            pass  # asyncssh can't generate this type -> skip it (fail-closed: don't fabricate)
+    return keys or [asyncssh.generate_private_key("ssh-ed25519")]
+
+
 def _make_server_factory(facade: SshFacade):
     """Build a per-connection asyncssh.SSHServer subclass bound to *facade*."""
     import asyncssh
@@ -156,7 +227,13 @@ def _make_server_factory(facade: SshFacade):
             return True  # always require auth
 
         def password_auth_supported(self) -> bool:
-            return True
+            # An authored login point (accept_creds) always needs the password path, even on a
+            # captured pubkey-only host — the planted credential is a deliberate objective, not a
+            # measurement gap. Otherwise gate on the measured methods.
+            if facade.cfg.accept_creds:
+                return True
+            methods = facade.cfg.auth_methods
+            return "password" in methods if methods is not None else True
 
         def validate_password(self, username: str, password: str) -> bool:
             accepted = facade.cfg.accept_creds.get(username) == password
@@ -173,7 +250,14 @@ def _make_server_factory(facade: SshFacade):
             return accepted
 
         def public_key_auth_supported(self) -> bool:
-            return True
+            methods = facade.cfg.auth_methods
+            return "publickey" in methods if methods is not None else True
+
+        def kbdint_auth_supported(self) -> bool:
+            # asyncssh offers keyboard-interactive as a password path; gate it on the measured
+            # methods so a captured pubkey-only host doesn't advertise a password surface via kbdint.
+            methods = facade.cfg.auth_methods
+            return "keyboard-interactive" in methods if methods is not None else False
 
         def validate_public_key(self, username: str, key) -> bool:
             try:

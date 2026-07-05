@@ -585,6 +585,102 @@ def _axfr_allowed(server: str, port: int, zone: str, timeout: float) -> bool | N
         return False  # server responded but refused / failed the transfer
 
 
+# ------------------------------------------------------------------------------- SSH
+
+
+def verify_ssh(host: str, port: int = 22, *, timeout: float = 5.0) -> VerifyReport:
+    from rangefinder.capture.ssh import (
+        _probe_auth_methods, _read_kexinit, _weak_offered, capture_ssh)
+
+    service, warnings, _ = capture_ssh(host, port, timeout=timeout)
+    report = VerifyReport("ssh", f"{host}:{port}", warnings=list(warnings))
+
+    # Reuse what capture already measured on the real host (its KEXINIT name-lists + auth methods
+    # are in `service`) instead of re-probing production a second time. real_kex is None when the
+    # capture couldn't read the KEXINIT.
+    real_kex = None
+    if "kex_algs" in service:
+        real_kex = {"kex": service["kex_algs"], "host_key": service["host_key_algs"],
+                    "enc_s2c": service["encryption_algs"], "mac_s2c": service["mac_algs"]}
+    real_auth = service.get("auth_methods")
+
+    with _ServedFacade(service) as srv:
+        try:
+            repl_kex = _read_kexinit("127.0.0.1", srv.port, timeout)[1]
+        except Exception:
+            repl_kex = None
+        repl_auth = _probe_auth_methods("127.0.0.1", srv.port, timeout)
+        time.sleep(0.1)
+        det_events = srv.events
+    _detection(report, det_events)
+
+    # Compare at the finding level: asyncssh can't byte-match OpenSSH's algorithm lists, but the
+    # transferable exposures — which weak algorithms are offered, the host-key type, and whether
+    # password auth is enabled — must round-trip. A dimension we couldn't observe on one side is
+    # recorded as a boundary, never silently scored as a match.
+    if real_kex is not None and repl_kex is not None:
+        report.total += 1
+        rw, pw = _weak_offered(real_kex), _weak_offered(repl_kex)
+        if rw == pw:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:weak_algorithms", "posture", f"real {sorted(rw)} vs replica {sorted(pw)}"))
+        report.total += 1
+        rt, pt = _ssh_key_types(real_kex["host_key"]), _ssh_key_types(repl_kex["host_key"])
+        if rt == pt:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:host_key_type", "posture", f"real {sorted(rt)} vs replica {sorted(pt)}"))
+    else:
+        report.boundary.append("SSH crypto posture not verified — a KEXINIT read was inconclusive")
+
+    if real_auth is not None and repl_auth is not None:
+        report.total += 1
+        rp, pp = _ssh_password_auth(real_auth), _ssh_password_auth(repl_auth)
+        if rp == pp:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:password_auth", "posture", f"real password-auth={rp} vs replica {pp}"))
+    else:
+        report.boundary.append(
+            "SSH password-auth posture not verified — an auth probe was inconclusive")
+
+    report.boundary.append(
+        "SSH posture compared at the finding level — the weak-algorithm set, host-key type and "
+        "password-auth policy round-trip; exact algorithm ordering / extension lists are not "
+        "byte-matched (asyncssh backend, not OpenSSH)")
+    return report
+
+
+def _ssh_key_type(alg: str) -> str:
+    # Keep the FIDO (sk-) and certificate distinctions so a real host on a cert/FIDO host key
+    # isn't scored as matching a twin that fell back to a plain key of the same family.
+    a = alg.lower()
+    prefix = ""
+    if a.startswith("sk-"):
+        prefix += "sk-"
+    if "-cert-" in a or "cert-v01" in a:
+        prefix += "cert-"
+    for family in ("ed25519", "ecdsa", "rsa"):
+        if family in a:
+            return prefix + family
+    if "dss" in a or "dsa" in a:
+        return prefix + "dsa"
+    return a
+
+
+def _ssh_key_types(algs: list[str]) -> set[str]:
+    return {_ssh_key_type(a) for a in algs}
+
+
+def _ssh_password_auth(methods: list[str]) -> bool:
+    # keyboard-interactive is a password path too (PAM / asyncssh), so it counts as password auth.
+    return "password" in methods or "keyboard-interactive" in methods
+
+
 def _diff_files(real: dict, repl: dict) -> str:
     # Paths are case-insensitive (SMB); content comparison stays byte-exact.
     repl_cf = {p.casefold(): c for p, c in repl.items()}
