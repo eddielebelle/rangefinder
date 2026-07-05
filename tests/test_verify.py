@@ -44,6 +44,20 @@ def test_verify_http_faithful(tmp_path):
     assert report.ok
 
 
+def test_verify_http_method_posture_round_trips():
+    """TRACE/XST and the advertised methods must round-trip as a matched posture — the twin
+    reproduces the method behaviour, not just the route content."""
+    service = {
+        "type": "http", "port": 80, "trace_enabled": True,
+        "paths": {"/": {"body": "home page"}},
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_http(f"http://127.0.0.1:{srv.port}")
+
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert not any(d.kind == "posture" for d in report.divergences)
+
+
 def test_diff_http_has_teeth():
     """The diff engine must flag status, body and header divergences, not rubber-stamp."""
     from rangefinder.capture.http import _KEEP_HEADERS, _Resp

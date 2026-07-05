@@ -63,6 +63,7 @@ class _Request:
     headers: dict[str, str]  # lowercased keys
     nbytes: int  # bytes consumed (line + headers + drained body)
     wants_close: bool
+    head: bytes  # verbatim request-line + header bytes (for a faithful TRACE echo)
 
 
 @register("http")
@@ -102,6 +103,17 @@ class HttpFacade(Facade):
             req = await self._read_request(reader)
             if req is None:
                 return  # EOF or unrecoverable parse error (already responded if 400)
+
+            # TRACE is a server-wide method (it echoes the request — the XST exposure), so it is
+            # handled before route dispatch. OPTIONS, by contrast, is resource-scoped and goes
+            # through the normal route + auth path below, so it can't fabricate surface on a gated
+            # or nonexistent path.
+            if req.method == "TRACE":
+                await self._handle_trace(scope, req, writer)
+                if not self.cfg.keepalive or req.wants_close:
+                    return
+                continue
+
             route = self.routes.get(req.path)
 
             if route is not None and route.auth_ntlm:
@@ -163,6 +175,25 @@ class HttpFacade(Facade):
             if close:
                 return
 
+    async def _handle_trace(self, scope, req: _Request, writer) -> None:
+        """Reproduce the captured TRACE posture. When ``trace_enabled`` was measured, echo the
+        request verbatim (message/http) — the Cross-Site Tracing exposure; otherwise refuse it
+        (405) like a hardened server. Fail-closed default refuses TRACE."""
+        if self.cfg.trace_enabled:
+            status, body, ctype, headers = 200, req.head, "message/http", {}
+        else:
+            headers = {"Allow": ", ".join(self.cfg.allowed_methods)} if self.cfg.allowed_methods else {}
+            status, body, ctype = 405, b"", "text/plain; charset=utf-8"
+
+        close = not self.cfg.keepalive or req.wants_close
+        resp_bytes = await self._send(writer, req, status, body, ctype, headers, close)
+        scope.emit(ev.http_request(
+            scope, method=req.method, path=req.path, query=req.query, original=req.target,
+            version=req.version, user_agent=req.headers.get("user-agent"),
+            referrer=req.headers.get("referer"), status_code=status,
+            request_bytes=req.nbytes, response_bytes=resp_bytes,
+            matched_route=req.path if self.routes.get(req.path) else None, vuln_id=None))
+
     # ---- request parsing ---------------------------------------------------------
     async def _read_request(self, reader: asyncio.StreamReader) -> _Request | None:
         try:
@@ -173,6 +204,7 @@ class HttpFacade(Facade):
             return None  # peer closed
 
         nbytes = len(line)
+        raw_head = bytearray(line)
         try:
             parts = line.decode("latin-1").rstrip("\r\n").split(" ")
             method, target, proto = parts[0], parts[1], parts[2]
@@ -191,6 +223,7 @@ class HttpFacade(Facade):
             if not hline:
                 break
             nbytes += len(hline)
+            raw_head += hline
             if hline in (b"\r\n", b"\n"):
                 break
             try:
@@ -221,6 +254,7 @@ class HttpFacade(Facade):
             headers=headers,
             nbytes=nbytes,
             wants_close=wants_close,
+            head=bytes(raw_head),
         )
 
     async def _drain_body(
@@ -257,15 +291,23 @@ class HttpFacade(Facade):
                 None,
                 None,
             )
-        if req.method not in route.methods and req.method != "HEAD":
-            headers = {"Allow": ", ".join(sorted(route.methods))}
-            return (405, b"", "text/plain; charset=utf-8", headers, None, req.path)
+        # Auth gate first — a protected resource challenges before revealing anything (incl. its
+        # methods via OPTIONS), so OPTIONS on a gated path can't bypass auth or leak its existence.
         if route.auth_realm is not None:
             creds = _basic_creds(req)
             authorized = creds is not None and route.auth_users.get(creds[0]) == creds[1]
             if not authorized:
                 headers = {"WWW-Authenticate": f'Basic realm="{route.auth_realm}"'}
                 return (401, b"", "text/plain; charset=utf-8", headers, None, req.path)
+        # OPTIONS on an existing (and authorized) resource advertises the measured server methods —
+        # but only when they were measured. Unmeasured -> fall through to the normal method check
+        # (405), so the twin never fabricates OPTIONS support the real server didn't expose.
+        if req.method == "OPTIONS" and self.cfg.allowed_methods is not None:
+            headers = {"Allow": ", ".join(self.cfg.allowed_methods)}
+            return (200, b"", "text/plain; charset=utf-8", headers, None, req.path)
+        if req.method not in route.methods and req.method != "HEAD":
+            headers = {"Allow": ", ".join(sorted(route.methods))}
+            return (405, b"", "text/plain; charset=utf-8", headers, None, req.path)
         return (
             route.status,
             route.body,

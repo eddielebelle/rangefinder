@@ -66,6 +66,13 @@ class HttpConfig(ServiceBase):
     default_body: str | None = None
     default_content_type: str = "text/html; charset=utf-8"
     keepalive: bool = True
+    # HTTP method posture (FAIL-CLOSED). A server that echoes TRACE (Cross-Site Tracing) or
+    # advertises methods via OPTIONS is a real anonymous finding; the twin reproduces it only when
+    # the capture measured it. trace_enabled defaults False (TRACE refused). allowed_methods is
+    # None until measured: the facade only answers OPTIONS with 200 + Allow when the real server
+    # was seen doing so, so an unmeasured host never fabricates OPTIONS/method-enumeration surface.
+    trace_enabled: bool = False
+    allowed_methods: list[str] | None = None
 
 
 # ------------------------------------------------------------------------- Banner

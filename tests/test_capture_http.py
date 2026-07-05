@@ -81,3 +81,35 @@ def test_scrub_redacts_secrets_but_keeps_route():
 def test_verbatim_keeps_secrets():
     service, *_ = asyncio.run(_capture())
     assert "Sup3rSecret" in service["paths"]["/config.json"]["body"]
+
+
+def test_capture_measures_method_posture():
+    """Capture probes OPTIONS/TRACE and records the method posture as measured provenance —
+    TRACE echoing is the Cross-Site Tracing exposure."""
+    import asyncio as _asyncio
+
+    from rangefinder.config.services import HttpConfig, HttpPath
+    from rangefinder.facades.http import HttpFacade
+
+    async def _run():
+        ctx, _ = make_ctx()
+        cfg = HttpConfig(port=80, trace_enabled=True,
+                         allowed_methods=["GET", "HEAD", "POST", "OPTIONS"],
+                         paths={"/": HttpPath(body="home")})
+        facade = HttpFacade.from_config(cfg, ctx)
+        facade.bind_host = "127.0.0.1"
+        facade.port = 0
+        await facade.start()
+        try:
+            loop = _asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: capture_http(f"http://127.0.0.1:{facade.bound_port}/"))
+        finally:
+            await facade.stop()
+
+    service, warnings, report = _asyncio.run(_run())
+    assert service["trace_enabled"] is True
+    assert "OPTIONS" in service["allowed_methods"]
+    status = {i.field: i.status for i in report.items}
+    assert status.get("trace_enabled") == "measured"
+    assert status.get("allowed_methods") == "measured"
