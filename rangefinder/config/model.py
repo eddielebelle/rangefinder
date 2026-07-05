@@ -23,7 +23,8 @@ from rangefinder.config.services import BuiltinService
 # instead of a cryptic field-rejection deep inside a container.
 # v2: added Objective.sequence (kill-chain scoring).
 # v3: added kerberos facade + ADUser password/no_preauth/spn (AS-REP roasting).
-SCHEMA_VERSION = 3
+# v4: added LdapEntry.binary_attributes (base64) — objectSid/GUID/cert carried, not dropped.
+SCHEMA_VERSION = 4
 
 
 class OS(str, Enum):

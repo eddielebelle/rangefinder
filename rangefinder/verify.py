@@ -322,7 +322,7 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
     service, warnings, _ = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
                                      password=password, timeout=timeout, scrub=False)
     report = VerifyReport("ldap", f"{host}:{port}", warnings=list(warnings))
-    real = {e["dn"]: e["attributes"] for e in service["entries"]}
+    real = {e["dn"]: _ldap_all_attrs(e) for e in service["entries"]}
 
     with _ServedFacade(service) as srv:
         # Enumerate the replica through the facade's own rendering, same access level.
@@ -334,7 +334,7 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
         time.sleep(0.1)
         det_events = srv.events
     real_anon = _probe_anonymous_bind(host, port, tls=tls, timeout=timeout)
-    repl = {e["dn"]: e["attributes"] for e in repl_service["entries"]}
+    repl = {e["dn"]: _ldap_all_attrs(e) for e in repl_service["entries"]}
     _detection(report, det_events)
 
     for dn, attrs in real.items():
@@ -376,6 +376,13 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
 # facade), so their value is *expected* to differ between the capture read and the replica read.
 # Comparing them is a guaranteed intermittent false divergence; exclude by name (case-insensitive).
 _EPHEMERAL_LDAP_ATTRS = frozenset({"currenttime"})
+
+
+def _ldap_all_attrs(entry: dict) -> dict:
+    """Text + binary attributes merged for diffing — a lossy binary replay (objectSid/GUID/ACL)
+    then shows up as an attribute divergence just like a text one. Binary values are base64 on
+    both sides, so an identical round-trip compares equal."""
+    return {**entry.get("attributes", {}), **entry.get("binary_attributes", {})}
 
 
 def _diff_attrs(real: dict, repl: dict) -> str:

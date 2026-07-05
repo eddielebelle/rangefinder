@@ -7,13 +7,16 @@ the real server, it does on the replica too; if it is locked down, the replica r
 same little. No misconfig detection: the exposure is whatever the capture saw.
 
 Reuses the project's pyasn1 + rfc2251 machinery (the same wire format the facade speaks),
-so there is no extra dependency. Binary attribute values (objectSid, GUIDs) that are not
-UTF-8 are dropped — text attributes (cn, sAMAccountName, description, memberOf, …) are what
-enumeration cares about.
+so there is no extra dependency. Text attributes (cn, sAMAccountName, description, memberOf, …)
+are recorded as UTF-8; binary-syntax attributes (objectSid, objectGUID, userCertificate,
+ntSecurityDescriptor) are recorded base64 in ``binary_attributes`` and replayed as raw octets —
+so SID/GUID/ACL identifiers that SID-based enumeration and BloodHound-style tooling read survive
+the capture instead of being dropped.
 """
 
 from __future__ import annotations
 
+import base64
 import socket
 import ssl
 
@@ -28,6 +31,17 @@ _ROOTDSE_ATTRS = [
     "supportedLDAPVersion", "dnsHostName",
 ]
 _SENSITIVE_ATTRS = {"userpassword", "unicodepwd", "ntpwdhistory", "lmpwdhistory"}
+
+# Attributes that are binary-syntax regardless of whether a given value happens to decode as UTF-8,
+# so a coincidentally-textual objectSid is still carried (and served) as binary rather than routed
+# to the text path and mangled by scrubbing. Also the allow-list of binary attrs kept under --scrub:
+# an *unknown* binary attribute (a text attr rerouted by a stray non-UTF-8 byte) may hide a secret,
+# so scrubbing drops it fail-closed; these known identifiers are not secrets and are kept.
+_BINARY_ATTRS = {
+    "objectsid", "objectguid", "usercertificate", "usercertificate;binary",
+    "cacertificate", "cacertificate;binary", "ntsecuritydescriptor",
+    "msds-allowedtoactonbehalfofotheridentity",
+}
 
 # LDAP resultCodes that mean "this bind is refused" (anon disabled / bad creds), as opposed to a
 # transient or protocol condition (confidentialityRequired, busy, unavailable, …). Only a refusal
@@ -83,7 +97,7 @@ def capture_ldap(
                 f"anonymous bind rejected (resultCode {rc}); recording hardened posture "
                 "(directory not anonymously enumerable)")
 
-        captured: list[tuple[str, dict]] = []
+        captured: list[tuple[str, dict, dict]] = []
         if anon_denied:
             try:
                 root = _search(sock, counter.next(), "", 0, _ROOTDSE_ATTRS, max_entries)
@@ -94,6 +108,7 @@ def capture_ldap(
             # than silently produce an empty twin for a directory that is in fact exposed.
             root = _search(sock, counter.next(), "", 0, _ROOTDSE_ATTRS, max_entries)
         root_attrs = root[0][1] if root else {}
+        root_battrs = root[0][2] if root else {}
         # namingContexts is anonymously readable from the RootDSE even on a hardened DC, so it
         # still gives us the base DN; only the subtree *enumeration* is gated on anon access.
         ncs = root_attrs.get("namingContexts") or root_attrs.get("defaultNamingContext") or []
@@ -121,17 +136,25 @@ def capture_ldap(
     elif ncs:
         base_dn = ncs[0]
 
+    def _entry(dn, text, binary):
+        clean_text, clean_binary = _clean_entry(text, binary, scrubber)
+        e = {"dn": dn, "attributes": clean_text}
+        if clean_binary:
+            e["binary_attributes"] = clean_binary
+        return e
+
     entries: list[dict] = []
     seen: set = set()
-    if root_attrs:
-        entries.append({"dn": "", "attributes": _clean(root_attrs, scrubber)})
+    if root_attrs or root_battrs:
+        entries.append(_entry("", root_attrs, root_battrs))
         seen.add("")
-    for dn, attrs in captured:
+    for dn, attrs, battrs in captured:
         if dn in seen:
             continue
         seen.add(dn)
-        entries.append({"dn": dn, "attributes": _clean(attrs, scrubber)})
+        entries.append(_entry(dn, attrs, battrs))
     n_entries = sum(1 for e in entries if e["dn"] != "")
+    n_binary = sum(len(e.get("binary_attributes", {})) for e in entries)
 
     service: dict = {"type": "ldap", "port": port}
     if tls:
@@ -148,13 +171,17 @@ def capture_ldap(
         service["allow_anonymous_bind"] = False
     service["entries"] = entries
 
-    warnings.append(f"captured {n_entries} entries under {base_dn or '(unknown base)'}")
+    warnings.append(f"captured {n_entries} entries under {base_dn or '(unknown base)'}"
+                    + (f" ({n_binary} binary attribute(s) preserved)" if n_binary else ""))
 
     perspective = "anonymous bind" if anonymous else f"authenticated as {bind_dn!r}"
     report = CaptureReport(target=host, perspective=perspective, protocol="ldap")
     report.measured("tls", tls, "LDAPS" if tls else "plaintext ldap")
     report.measured("base_dn", base_dn or "(unknown)", "RootDSE namingContexts")
     report.measured("entries", n_entries, "readable at this bind")
+    if n_binary:
+        report.measured("binary_attributes", n_binary,
+                        "objectSid/GUID/cert/ACL values carried base64 and replayed as raw octets")
     if anonymous:
         if anon_denied:
             report.measured("allow_anonymous_bind", False,
@@ -279,7 +306,7 @@ def _probe_anonymous_bind(host: str, port: int, *, tls: bool = False,
             pass
 
 
-def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> list[tuple[str, dict]]:
+def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> list[tuple[str, dict, dict]]:
     msg = L.LDAPMessage()
     msg["messageID"] = mid
     sr = L.SearchRequest()
@@ -306,13 +333,20 @@ def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> li
             entry = resp["protocolOp"]["searchResEntry"]
             dn = str(entry["objectName"])
             attrs: dict[str, list[str]] = {}
+            battrs: dict[str, list[str]] = {}
             for a in entry["attributes"]:
                 name = str(a["type"])
-                vals = [_val(v) for v in a["vals"]]
-                vals = [v for v in vals if v is not None]
-                if vals:
-                    attrs[name] = vals
-            out.append((dn, attrs))
+                raw = [bytes(v) for v in a["vals"]]
+                if not raw:
+                    continue  # a valueless attribute — omit rather than record an empty set
+                # Known-binary attrs go binary by name (even if a value is coincidentally UTF-8);
+                # otherwise decide by content.
+                text = None if name.lower() in _BINARY_ATTRS else _decode_text(raw)
+                if text is not None:
+                    attrs[name] = text
+                else:
+                    battrs[name] = [base64.b64encode(b).decode("ascii") for b in raw]
+            out.append((dn, attrs, battrs))
             if len(out) >= limit:
                 # Drain until done so the stream stays aligned for the next query.
                 _drain_until_done(sock)
@@ -370,22 +404,40 @@ def _recv_exact(sock, n: int) -> bytes:
     return buf
 
 
-def _val(value) -> str | None:
-    try:
-        return bytes(value).decode("utf-8")
-    except UnicodeDecodeError:
-        return None  # binary attribute value (objectSid, GUID, cert) — skip
+def _decode_text(raw: list[bytes]) -> list[str] | None:
+    """Decode an attribute's values as UTF-8, or None if any value is binary (so the whole
+    single-syntax attribute is carried as base64 instead)."""
+    out: list[str] = []
+    for b in raw:
+        try:
+            out.append(b.decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+    return out
 
 
 # --------------------------------------------------------------------------- scrubbing
 
 
-def _clean(attrs: dict, scrubber: Scrubber | None) -> dict:
-    if scrubber is None:
-        return {k: list(v) for k, v in attrs.items()}
-    out: dict[str, list[str]] = {}
-    for name, vals in attrs.items():
+def _clean_entry(text: dict, binary: dict, scrubber: Scrubber | None) -> tuple[dict, dict]:
+    """Scrub text attribute values; drop password-ish attributes from both text and binary.
+
+    Binary identifiers (objectSid/GUID/cert/ACL) are carried verbatim — they are not secrets, and
+    corrupting them would defeat the point of capturing them. Sensitive binary (unicodePwd,
+    ntPwdHistory) is still dropped by the same sensitive-attr set.
+    """
+    clean_text: dict[str, list[str]] = {}
+    for name, vals in text.items():
         if name.lower() in _SENSITIVE_ATTRS:
-            continue  # drop password-ish attributes entirely
-        out[name] = [scrubber.text(v) for v in vals]
-    return out
+            continue
+        clean_text[name] = [scrubber.text(v) for v in vals] if scrubber else list(vals)
+    clean_binary: dict[str, list[str]] = {}
+    for name, vals in binary.items():
+        if name.lower() in _SENSITIVE_ATTRS:
+            continue
+        if scrubber is not None and name.lower() not in _BINARY_ATTRS:
+            # Under --scrub an unknown binary attribute may be a text attr rerouted by a stray
+            # non-UTF-8 byte, hiding a secret we can't redact in base64 — drop it fail-closed.
+            continue
+        clean_binary[name] = list(vals)
+    return clean_text, clean_binary
