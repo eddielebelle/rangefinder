@@ -165,7 +165,7 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
                 nmap: bool = False) -> VerifyReport:
     from rangefinder.capture.http import _KEEP_HEADERS, _build_opener, _fetch, capture_http
 
-    service, warnings = capture_http(url, max_paths=max_paths, scrub=False, timeout=timeout)
+    service, warnings, _ = capture_http(url, max_paths=max_paths, scrub=False, timeout=timeout)
     report = VerifyReport("http", url, warnings=list(warnings))
 
     parsed = urlparse(url if "://" in url else "http://" + url)
@@ -282,19 +282,23 @@ def _diff_http(path, real, repl, compare_headers) -> list[Divergence]:
 
 def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str = "",
                 password: str = "", timeout: float = 5.0) -> VerifyReport:
-    from rangefinder.capture.ldap import capture_ldap
+    from rangefinder.capture.ldap import _probe_anonymous_bind, capture_ldap
 
-    service, warnings = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
+    service, warnings, _ = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
                                      password=password, timeout=timeout, scrub=False)
     report = VerifyReport("ldap", f"{host}:{port}", warnings=list(warnings))
     real = {e["dn"]: e["attributes"] for e in service["entries"]}
 
     with _ServedFacade(service) as srv:
         # Enumerate the replica through the facade's own rendering, same access level.
-        repl_service, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
-                                       password=password, timeout=timeout, scrub=False)
+        repl_service, _, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
+                                          password=password, timeout=timeout, scrub=False)
+        # Probe anonymous-bind acceptance directly on the twin (behavioural, not the fail-closed
+        # config value), so a facade regression that served anon would surface as a divergence.
+        repl_anon = _probe_anonymous_bind("127.0.0.1", srv.port, timeout=timeout)
         time.sleep(0.1)
         det_events = srv.events
+    real_anon = _probe_anonymous_bind(host, port, tls=tls, timeout=timeout)
     repl = {e["dn"]: e["attributes"] for e in repl_service["entries"]}
     _detection(report, det_events)
 
@@ -311,6 +315,19 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
     for dn in repl:
         if dn not in real:
             report.divergences.append(Divergence(dn or "(RootDSE)", "extra", "entry only on replica"))
+
+    # Posture diff: the twin must reproduce the anon-bind posture, not just the entries. We compare
+    # the *behaviour* observed on each side (a live anonymous bind), so anon enforcement can't
+    # silently regress into a false "anonymous bind allowed" finding. (Inconclusive probes on either
+    # side -> skip; there's nothing to assert.)
+    if real_anon is not None and repl_anon is not None:
+        report.total += 1
+        if real_anon == repl_anon:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:allow_anonymous_bind", "posture",
+                f"real anon-bind accepted={real_anon} vs replica {repl_anon}"))
 
     report.boundary.append(
         "fidelity claimed only for the "
@@ -389,6 +406,15 @@ def verify_smb(host: str, port: int = 445, *, username: str = "", password: str 
     for f in ("server_os", "signing_required", "smb1_enabled", "reject_unknown_users", "max_dialect"):
         if f not in service:
             continue
+        # Known facade limitation: the impacket backend can't do AES-CMAC signing, so at SMB 3.1.1
+        # it advertises signing enabled-but-not-required regardless of cfg.signing_required. That's
+        # a documented boundary, not a per-host fidelity gap — diffing it would flag every faithful
+        # modern (3.1.1, signing-required) twin, so record it as a boundary and skip the diff.
+        if f == "signing_required" and service.get("max_dialect") == "3.1.1":
+            report.boundary.append(
+                "SMB 3.1.1 signing_required not reproduced: the impacket backend can't AES-CMAC "
+                "sign, so the twin advertises signing enabled-not-required at 3.1.1 (known limit)")
+            continue
         report.total += 1
         rv, pv = service.get(f), repl_service.get(f)
         if rv == pv:
@@ -430,12 +456,15 @@ def _recapture_smb(host, port, username, password, domain, timeout, attempts: in
 def verify_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0) -> VerifyReport:
     from rangefinder.capture.dns import _server_ip, capture_dns
 
-    service, warnings = capture_dns(host, port, zone=zone, timeout=timeout, scrub=False)
+    service, warnings, _ = capture_dns(host, port, zone=zone, timeout=timeout, scrub=False)
     report = VerifyReport("dns", f"{host}:{port} ({zone})", warnings=list(warnings))
-    queries = sorted({(r["name"], r["type"]) for r in service["records"]})
+    # Exclude SOA from the per-record answer diff: its serial is volatile on a live (dynamic-update)
+    # zone and would ticker between capture and this re-query, flagging a faithful twin as divergent
+    # (the same live-operational-attribute trap as LDAP currentTime). The zone-transfer posture is
+    # still exercised below, and the SOA still brackets a served AXFR.
+    queries = sorted({(r["name"], r["type"]) for r in service["records"] if r["type"] != "SOA"})
     if not queries:
-        report.warnings.append("no records captured; nothing to verify")
-        return report
+        report.warnings.append("no records captured; verifying zone-transfer posture only")
 
     server = _server_ip(host)
     with _ServedFacade(service) as srv:
@@ -449,8 +478,25 @@ def verify_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0) ->
                     f"{sorted(real_ans)} vs replica {sorted(repl_ans)}"))
             else:
                 report.matched += 1
+        # Posture diff: the twin must reproduce the zone-transfer decision, not just the records.
+        # Attempt a live AXFR on both sides and compare — so a permitted transfer (a real exposure)
+        # can't silently regress, and a refused one can't be fabricated on the twin.
+        repl_axfr = _axfr_allowed("127.0.0.1", srv.port, zone, timeout)
         time.sleep(0.1)
         det_events = srv.events
+    real_axfr = _axfr_allowed(server, port, zone, timeout)
+    # Only score the posture when both sides were actually observed (an unreachable real server
+    # returns None); comparing None==None would fake a match on a posture we never measured.
+    if real_axfr is None or repl_axfr is None:
+        report.warnings.append("AXFR posture not verified (a live transfer probe was inconclusive)")
+    else:
+        report.total += 1
+        if real_axfr == repl_axfr:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:axfr_allowed", "posture",
+                f"real AXFR allowed={real_axfr} vs replica {repl_axfr}"))
     _detection(report, det_events)
     report.boundary.append(
         "verified the records the capture found (AXFR or the probe set); names never queried "
@@ -478,6 +524,30 @@ def _dns_answers(server: str, port: int, name: str, rtype: str, timeout: float) 
         for rdata in rrset:
             out.add(f"{label}:{rdata.to_text()}")
     return frozenset(out)
+
+
+def _axfr_allowed(server: str, port: int, zone: str, timeout: float) -> bool | None:
+    """Whether a zone transfer (AXFR) of ``zone`` is permitted: True if it succeeds, False if the
+    server (reachably) refuses it, or None if the server couldn't be observed (unreachable /
+    filtered) — so the caller doesn't score an unmeasured posture as a match.
+
+    Mirrors ``capture_dns``'s transfer parameters (relativize=False on the xfr) so the two agree on
+    what 'succeeded' means; check_origin=False because we only care about success, not zone
+    well-formedness.
+    """
+    import dns.exception
+    import dns.query
+    import dns.zone
+
+    try:
+        z = dns.zone.from_xfr(
+            dns.query.xfr(server, zone, port=port, timeout=timeout, relativize=False),
+            relativize=False, check_origin=False)
+        return z is not None
+    except (ConnectionError, TimeoutError, OSError, dns.exception.Timeout):
+        return None  # couldn't reach / observe the server — not a measured refusal
+    except Exception:
+        return False  # server responded but refused / failed the transfer
 
 
 def _diff_files(real: dict, repl: dict) -> str:

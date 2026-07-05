@@ -29,6 +29,20 @@ _ROOTDSE_ATTRS = [
 ]
 _SENSITIVE_ATTRS = {"userpassword", "unicodepwd", "ntpwdhistory", "lmpwdhistory"}
 
+# LDAP resultCodes that mean "this bind is refused" (anon disabled / bad creds), as opposed to a
+# transient or protocol condition (confidentialityRequired, busy, unavailable, …). Only a refusal
+# of the *anonymous* bind is a hardened posture; anything else is a genuine capture error.
+_BIND_REFUSED = frozenset({48, 49, 53})  # inappropriateAuthentication / invalidCredentials / unwilling
+
+
+def _wrap_tls(sock):
+    """Wrap a socket for LDAPS. Verification is intentionally disabled — capture points at hosts
+    with self-signed / internal-CA certs, and we are recording exposure, not trusting the peer."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(sock)
+
 
 def capture_ldap(
     host: str,
@@ -40,34 +54,56 @@ def capture_ldap(
     timeout: float = 5.0,
     max_entries: int = 5000,
     scrub: bool = False,
-) -> tuple[dict, list[str]]:
-    """Bind, enumerate, and return (ldap_service_config, warnings)."""
+) -> tuple[dict, list[str], "CaptureReport"]:
+    """Bind, enumerate, and return (ldap_service_config, warnings, capture_report)."""
+    from rangefinder.capture.posture import CaptureReport
+
     warnings: list[str] = []
     scrubber = Scrubber() if scrub else None
     sock = socket.create_connection((host, port), timeout)
     try:
         if tls:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            sock = ctx.wrap_socket(sock)
+            sock = _wrap_tls(sock)
 
         counter = _Counter()
+        anonymous = bind_dn == ""
         rc = _bind(sock, counter.next(), bind_dn, password)
-        if rc != 0:
+        # A non-zero bind is a hardened posture ONLY when it is the *anonymous* bind being refused
+        # (inappropriateAuthentication / unwilling / invalidCredentials). A credentialed failure, or
+        # any other condition (confidentialityRequired, busy, unavailable, …), is a genuine capture
+        # error — raising is more honest than silently emitting an empty "hardened" twin.
+        anon_denied = anonymous and rc in _BIND_REFUSED
+        if rc != 0 and not anon_denied:
             raise ValueError(f"LDAP bind failed (resultCode {rc})")
-
-        root = _search(sock, counter.next(), "", 0, _ROOTDSE_ATTRS, max_entries)
-        root_attrs = root[0][1] if root else {}
-        ncs = root_attrs.get("namingContexts") or root_attrs.get("defaultNamingContext") or []
-        if not ncs:
-            warnings.append("server advertised no namingContexts; captured RootDSE only")
+        if anon_denied:
+            # Record the hardening and build a twin that also refuses anon. The RootDSE stays
+            # anonymously readable (RFC 4513), so still read it for a believable twin, but don't
+            # enumerate the directory — anon can't, and neither should the replica.
+            warnings.append(
+                f"anonymous bind rejected (resultCode {rc}); recording hardened posture "
+                "(directory not anonymously enumerable)")
 
         captured: list[tuple[str, dict]] = []
-        for nc in ncs:
-            if len(captured) >= max_entries:
-                break
-            captured.extend(_search(sock, counter.next(), nc, 2, ["*"], max_entries - len(captured)))
+        if anon_denied:
+            try:
+                root = _search(sock, counter.next(), "", 0, _ROOTDSE_ATTRS, max_entries)
+            except (EOFError, PyAsn1Error, OSError):
+                root = []  # a fully hardened server may refuse even the RootDSE read
+        else:
+            # On the success path a RootDSE read failure is a real error — let it propagate rather
+            # than silently produce an empty twin for a directory that is in fact exposed.
+            root = _search(sock, counter.next(), "", 0, _ROOTDSE_ATTRS, max_entries)
+        root_attrs = root[0][1] if root else {}
+        # namingContexts is anonymously readable from the RootDSE even on a hardened DC, so it
+        # still gives us the base DN; only the subtree *enumeration* is gated on anon access.
+        ncs = root_attrs.get("namingContexts") or root_attrs.get("defaultNamingContext") or []
+        if not anon_denied:
+            if not ncs:
+                warnings.append("server advertised no namingContexts; captured RootDSE only")
+            for nc in ncs:
+                if len(captured) >= max_entries:
+                    break
+                captured.extend(_search(sock, counter.next(), nc, 2, ["*"], max_entries - len(captured)))
         _unbind(sock, counter.next())
     finally:
         try:
@@ -85,30 +121,77 @@ def capture_ldap(
     elif ncs:
         base_dn = ncs[0]
 
-    entries: list[dict] = [{"dn": "", "attributes": _clean(root_attrs, scrubber)}]
-    seen = {""}
-    dropped = 0
+    entries: list[dict] = []
+    seen: set = set()
+    if root_attrs:
+        entries.append({"dn": "", "attributes": _clean(root_attrs, scrubber)})
+        seen.add("")
     for dn, attrs in captured:
         if dn in seen:
             continue
         seen.add(dn)
-        cleaned = _clean(attrs, scrubber)
-        if not cleaned and not attrs:
-            dropped += 1
-        entries.append({"dn": dn, "attributes": cleaned})
+        entries.append({"dn": dn, "attributes": _clean(attrs, scrubber)})
+    n_entries = sum(1 for e in entries if e["dn"] != "")
 
     service: dict = {"type": "ldap", "port": port}
     if tls:
         service["tls"] = True
     if base_dn:
         service["base_dn"] = base_dn
-    # Reproduce the exposure we exercised: if anonymous bind returned data, the replica
-    # should allow anonymous bind too.
-    service["allow_anonymous_bind"] = bind_dn == ""
+    if anonymous:
+        # Reproduce what we exercised: anonymous bind is allowed iff it succeeded on the target.
+        service["allow_anonymous_bind"] = not anon_denied
+    else:
+        # Fail closed: the captured entries are the *authenticated* view. The twin must never
+        # serve them to anonymous clients — that would fabricate an exposure the real host does
+        # not have — regardless of the target's own anon-bind setting (measured below).
+        service["allow_anonymous_bind"] = False
     service["entries"] = entries
 
-    warnings.append(f"captured {len(entries) - 1} entries under {base_dn or '(unknown base)'}")
-    return service, warnings
+    warnings.append(f"captured {n_entries} entries under {base_dn or '(unknown base)'}")
+
+    perspective = "anonymous bind" if anonymous else f"authenticated as {bind_dn!r}"
+    report = CaptureReport(target=host, perspective=perspective, protocol="ldap")
+    report.measured("tls", tls, "LDAPS" if tls else "plaintext ldap")
+    report.measured("base_dn", base_dn or "(unknown)", "RootDSE namingContexts")
+    report.measured("entries", n_entries, "readable at this bind")
+    if anonymous:
+        if anon_denied:
+            report.measured("allow_anonymous_bind", False,
+                            f"anonymous simple bind rejected (resultCode {rc}); anon bind disabled")
+            report.unmeasurable("authenticated_directory", "unknown",
+                                "anonymous bind is refused, so nothing beyond the RootDSE was "
+                                "readable; the authenticated directory was not measured. "
+                                "Re-capture with -D/-w.")
+        else:
+            # We bound anonymously and it returned data -> anonymous bind is genuinely allowed.
+            report.measured("allow_anonymous_bind", True,
+                            "anonymous simple bind accepted and returned directory data")
+            report.unmeasurable("authenticated_directory", "unknown",
+                                "captured anonymously; entries/attributes visible only to an "
+                                "authenticated bind were not measured. Re-capture with -D/-w.")
+    else:
+        # Credentialed capture: the main bind was authenticated, so it can't itself observe the
+        # anonymous posture. Probe it directly so the report is honest — but the twin still fails
+        # closed (see allow_anonymous_bind above): measuring that the target *accepts* anon bind
+        # does not license serving the privileged view to anon.
+        anon_accepted = _probe_anonymous_bind(host, port, tls=tls, timeout=timeout)
+        if anon_accepted is True:
+            report.measured("anonymous_bind_accepted", True,
+                            "bind-level probe: target accepts an anonymous bind")
+            report.assumed(
+                "allow_anonymous_bind", False,
+                "target accepts anon bind, but its anonymously-readable subset was not enumerated "
+                "(captured with credentials); the twin refuses anon rather than serve the "
+                "privileged view — re-capture anonymously to measure the true anon exposure")
+        elif anon_accepted is False:
+            report.measured("allow_anonymous_bind", False,
+                            "bind-level probe: target rejects an anonymous bind")
+        else:
+            report.assumed("allow_anonymous_bind", False,
+                           "anonymous-bind posture not measured (probe inconclusive); "
+                           "assumed denied (fail-closed)")
+    return service, warnings, report
 
 
 # ------------------------------------------------------------------------ ldap client
@@ -134,6 +217,34 @@ def _bind(sock, mid: int, dn: str, password: str) -> int:
     sock.sendall(encoder.encode(msg))
     resp = _recv_message(sock)
     return int(resp["protocolOp"]["bindResponse"]["resultCode"])
+
+
+def _probe_anonymous_bind(host: str, port: int, *, tls: bool = False,
+                          timeout: float = 5.0) -> bool | None:
+    """Does the target accept an anonymous simple bind? True / False, or None if inconclusive.
+
+    Opens a fresh connection and sends an empty-DN, empty-password simple bind. A hardened
+    directory (anonymous bind disabled) answers inappropriateAuthentication -> False; a server
+    that accepts it -> True. Used by the credentialed capture path, whose main bind is
+    authenticated and so cannot itself observe the anonymous posture.
+    """
+    try:
+        sock = socket.create_connection((host, port), timeout)
+    except OSError:
+        return None
+    try:
+        if tls:
+            sock = _wrap_tls(sock)
+        rc = _bind(sock, 1, "", "")
+        _unbind(sock, 2)
+        return rc == 0
+    except (OSError, EOFError, PyAsn1Error, ValueError):
+        return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> list[tuple[str, dict]]:

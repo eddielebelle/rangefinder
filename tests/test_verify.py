@@ -82,6 +82,32 @@ def test_verify_ldap_round_trip():
     assert any("anonymous" in b for b in report.boundary)
 
 
+def test_verify_ldap_hardened_posture_round_trips():
+    """A directory that denies anonymous bind must round-trip as hardened: the anon-bind posture
+    matches (no posture divergence) and the privileged entry is not anonymously enumerable on the
+    twin — the fail-closed contract, locked by verify."""
+    service = {
+        "type": "ldap", "port": 389, "base_dn": "dc=acme,dc=corp",
+        "allow_anonymous_bind": False,
+        "entries": [
+            {"dn": "", "attributes": {"namingContexts": ["dc=acme,dc=corp"],
+                                      "objectClass": ["top"]}},
+            {"dn": "dc=acme,dc=corp", "attributes": {"objectClass": ["domain"], "dc": ["acme"]}},
+            {"dn": "cn=svc-web,dc=acme,dc=corp",
+             "attributes": {"objectClass": ["user"], "cn": ["svc-web"],
+                            "description": ["set password to Autumn2025!"]}},
+        ],
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_ldap("127.0.0.1", srv.port)
+
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    assert not any(d.kind == "posture" for d in report.divergences)
+    # svc-web is present in the served facade but anonymous enumeration can't reach it, so it
+    # never shows up as a captured entry on either side (no leak of the privileged view).
+    assert "cn=svc-web,dc=acme,dc=corp" not in {d.key for d in report.divergences}
+
+
 def test_diff_attrs_ignores_live_operational_attributes():
     """RootDSE currentTime is regenerated live per query by design, so its value is *expected*
     to differ between the capture read and the replica read. _diff_attrs must not flag it (the
@@ -135,6 +161,29 @@ def test_verify_dns_round_trip():
     assert report.total >= 4, report.warnings
     assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
     assert report.telemetry_events >= report.total  # every query logged a dns_query event
+
+
+def test_verify_dns_axfr_allowed_round_trips():
+    """A permitted zone transfer is a real exposure the twin must reproduce: verify captures it,
+    serves it, and the AXFR posture round-trips with no divergence (and the leaked records carry
+    through)."""
+    service = {
+        "type": "dns", "port": 53, "zone": "acme.corp", "autofill_hosts": False,
+        "axfr_allowed": True,
+        "records": [
+            {"name": "acme.corp", "type": "SOA",
+             "value": "dc01.acme.corp hostmaster.acme.corp 7 3600 600 86400 300", "ttl": 300},
+            {"name": "acme.corp", "type": "NS", "value": "dc01.acme.corp", "ttl": 300},
+            {"name": "dc01.acme.corp", "type": "A", "value": "10.20.0.10", "ttl": 300},
+            {"name": "secret-admin.acme.corp", "type": "A", "value": "10.20.0.99", "ttl": 300},
+        ],
+    }
+    with _ServedFacade(service) as srv:
+        report = verify_dns("127.0.0.1", srv.port, zone="acme.corp")
+
+    assert report.matched == report.total, [(d.key, d.kind, d.detail) for d in report.divergences]
+    # the zone-transfer posture is diffed and round-trips faithfully
+    assert not any(d.kind == "posture" for d in report.divergences)
 
 
 def test_diff_files_has_teeth():

@@ -29,7 +29,7 @@ def _identities():
                 groups=["Domain Admins"],
                 description="pw: Winter2024!",
             ),
-            ADUser(sam="jsmith", display_name="Jane Smith"),
+            ADUser(sam="jsmith", display_name="Jane Smith", password="S3cret!"),
         ],
     )
 
@@ -109,9 +109,9 @@ def _ctx_with_identities():
     return replace(ctx, identities=_identities()), sink
 
 
-async def _run_ldap_session(messages: list[bytes]) -> tuple[list, list]:
+async def _run_ldap_session(messages: list[bytes], cfg: LdapConfig | None = None) -> tuple[list, list]:
     ctx, sink = _ctx_with_identities()
-    facade = LdapFacade.from_config(LdapConfig(port=389), ctx)
+    facade = LdapFacade.from_config(cfg or LdapConfig(port=389), ctx)
     facade.port = 0
     facade.bind_host = "127.0.0.1"
     await facade.start()
@@ -208,6 +208,87 @@ def test_subtree_search_returns_users_and_groups():
     done = [r for r in responses if r["protocolOp"].getName() == "searchResDone"]
     assert int(done[0]["protocolOp"]["searchResDone"]["resultCode"]) == 0
     assert any(e["event"]["action"] == "ldap_search" for e in events)
+
+
+def test_anonymous_bind_denied_when_disabled():
+    cfg = LdapConfig(port=389, allow_anonymous_bind=False)
+    responses, _ = asyncio.run(_run_ldap_session([_bind_request()], cfg))
+    br = responses[0]["protocolOp"]["bindResponse"]
+    assert int(br["resultCode"]) == 48  # inappropriateAuthentication, like a hardened DC
+
+
+def test_anon_search_refused_but_rootdse_served_when_disabled():
+    """Anon operations off: the RootDSE stays anonymously readable (RFC 4513) but a directory
+    search from an unbound client is refused — the twin never leaks its view to anon."""
+    cfg = LdapConfig(port=389, allow_anonymous_bind=False)
+    reqs = [
+        _bind_request(),                                                            # denied
+        _search_request(2, "", 0, _present_filter("objectClass")),                  # RootDSE
+        _search_request(3, "DC=corp,DC=local", 2, _present_filter("objectClass")),  # subtree
+    ]
+    responses, _ = asyncio.run(_run_ldap_session(reqs, cfg))
+    entries = [r for r in responses if r["protocolOp"].getName() == "searchResEntry"]
+    # RootDSE (dn="") is still served
+    assert any(str(r["protocolOp"]["searchResEntry"]["objectName"]) == "" for r in entries)
+    # no directory objects leaked to the unbound client
+    assert not any(_sam(r) == "svc-backup" for r in entries)
+    # the subtree search is refused with operationsError
+    dones = [int(r["protocolOp"]["searchResDone"]["resultCode"])
+             for r in responses if r["protocolOp"].getName() == "searchResDone"]
+    assert 1 in dones  # operationsError
+
+
+def test_named_bind_unlocks_search_when_anon_disabled():
+    """With anon off, a *validated* named bind unlocks the directory — so a hardened twin still
+    serves an authenticated client holding a real credential."""
+    cfg = LdapConfig(port=389, allow_anonymous_bind=False)
+    reqs = [
+        _bind_request(mid=1, name="CN=jsmith,DC=corp,DC=local", password="S3cret!"),
+        _search_request(2, "DC=corp,DC=local", 2, _present_filter("objectClass")),
+    ]
+    responses, _ = asyncio.run(_run_ldap_session(reqs, cfg))
+    assert int(responses[0]["protocolOp"]["bindResponse"]["resultCode"]) == 0
+    entries = [r for r in responses if r["protocolOp"].getName() == "searchResEntry"]
+    assert any(_sam(r) == "svc-backup" for r in entries)  # directory enumerable post-bind
+
+
+def test_unvalidatable_bind_refused_and_directory_stays_gated_when_anon_disabled():
+    """The fail-closed contract's teeth: on a hardened twin a bind we cannot validate (any DN +
+    any password, e.g. a captured directory that holds no passwords) is refused with
+    invalidCredentials and does NOT unlock the directory — no trivial `-D cn=anything` bypass."""
+    cfg = LdapConfig(port=389, allow_anonymous_bind=False)
+    reqs = [
+        _bind_request(mid=1, name="CN=administrator,DC=corp,DC=local", password="anything"),
+        _search_request(2, "DC=corp,DC=local", 2, _present_filter("objectClass")),
+    ]
+    responses, _ = asyncio.run(_run_ldap_session(reqs, cfg))
+    assert int(responses[0]["protocolOp"]["bindResponse"]["resultCode"]) == 49  # invalidCredentials
+    entries = [r for r in responses if r["protocolOp"].getName() == "searchResEntry"]
+    assert not any(_sam(r) == "svc-backup" for r in entries)  # still gated
+    dones = [int(r["protocolOp"]["searchResDone"]["resultCode"])
+             for r in responses if r["protocolOp"].getName() == "searchResDone"]
+    assert 1 in dones  # operationsError — bind failure left the connection unauthenticated
+
+
+def test_failed_rebind_drops_authentication():
+    """RFC 4513: a failed bind after a good one resets the connection to unauthenticated, so a
+    hardened twin re-locks the directory rather than serving it on the strength of a stale bind."""
+    cfg = LdapConfig(port=389, allow_anonymous_bind=False)
+    reqs = [
+        _bind_request(mid=1, name="CN=jsmith,DC=corp,DC=local", password="S3cret!"),      # ok
+        _bind_request(mid=2, name="CN=jsmith,DC=corp,DC=local", password="wrong"),        # fails
+        _search_request(3, "DC=corp,DC=local", 2, _present_filter("objectClass")),        # gated
+    ]
+    responses, _ = asyncio.run(_run_ldap_session(reqs, cfg))
+    binds = [r for r in responses if r["protocolOp"].getName() == "bindResponse"]
+    assert int(binds[0]["protocolOp"]["bindResponse"]["resultCode"]) == 0
+    assert int(binds[1]["protocolOp"]["bindResponse"]["resultCode"]) == 49
+    entries = [r for r in responses if r["protocolOp"].getName() == "searchResEntry"]
+    assert not any(_sam(r) == "svc-backup" for r in entries)  # re-locked after the failed re-bind
+
+
+def r_attrs(resp):
+    return resp["protocolOp"]["searchResEntry"]["attributes"]
 
 
 def r_attrs(resp):

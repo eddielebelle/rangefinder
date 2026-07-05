@@ -8,7 +8,8 @@ use to find a DC). The facade replays the answers, so ``dig`` against the replic
 what the real server returned.
 
 Uses dnspython (a light client dep) instead of hand-rolling the wire format. Records the
-record types the dns facade can serve (A/AAAA/CNAME/MX/TXT/SRV); NS/SOA are not replayed.
+record types the dns facade can serve (A/AAAA/CNAME/MX/TXT/SRV), plus the apex SOA/NS so a
+captured AXFR can be replayed as a faithful, well-formed zone transfer.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import socket
 
 from rangefinder.capture.scrub import Scrubber
 
-_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "SRV")
+_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "SRV", "SOA", "NS")
 
 # Hostnames and AD service records worth asking for when a zone transfer is refused.
 _COMMON = ["", "www", "mail", "ns", "ns1", "ns2", "dc", "dc01", "dc02", "gc", "ldap",
@@ -28,8 +29,9 @@ _SRV = ["_ldap._tcp", "_kerberos._tcp", "_kerberos._udp", "_gc._tcp", "_kpasswd.
 
 
 def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
-                names: list[str] | None = None, scrub: bool = False) -> tuple[dict, list[str]]:
-    """Enumerate a zone and return (dns_service_config, warnings)."""
+                names: list[str] | None = None,
+                scrub: bool = False) -> tuple[dict, list[str], "CaptureReport"]:
+    """Enumerate a zone and return (dns_service_config, warnings, capture_report)."""
     import dns.exception
     import dns.flags
     import dns.message
@@ -57,10 +59,12 @@ def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
 
     axfr = False
     try:
-        # relativize=False so names *inside* rdata (SRV/MX/CNAME targets) come back as FQDNs,
-        # not relative to the origin — else the replica would serve "dc01" for "dc01.acme.corp".
-        z = dns.zone.from_xfr(dns.query.xfr(server, zone, port=port, timeout=timeout),
-                              relativize=False)
+        # relativize=False on BOTH the xfr and from_xfr (they must agree) so names inside rdata
+        # (SRV/MX/CNAME/NS targets) come back as FQDNs, not relative to the origin — else the
+        # replica would serve "dc01" for "dc01.acme.corp".
+        z = dns.zone.from_xfr(
+            dns.query.xfr(server, zone, port=port, timeout=timeout, relativize=False),
+            relativize=False)
         axfr = True
         for node_name, node in z.nodes.items():
             fqdn = str(node_name)
@@ -74,6 +78,8 @@ def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
     if not axfr:
         for fqdn in (names or _probe_names(zone)):
             for rtype in _TYPES:
+                if rtype in ("SOA", "NS") and fqdn.lower().rstrip(".") != zone:
+                    continue  # SOA/NS live only at the apex — don't probe them per-hostname
                 try:
                     q = dns.message.make_query(fqdn, rtype)
                     resp = dns.query.udp(q, server, port=port, timeout=timeout)
@@ -84,11 +90,24 @@ def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
                 for rrset in resp.answer:
                     _collect(str(rrset.name), rrset, add)
 
-    service: dict = {"type": "dns", "port": port, "zone": zone,
-                     "autofill_hosts": False, "records": records}
+    service: dict = {"type": "dns", "port": port, "zone": zone, "autofill_hosts": False,
+                     "axfr_allowed": axfr, "records": records}
     warnings.append(f"captured {len(records)} record(s) for {zone}"
                     + (" via AXFR" if axfr else " via probing"))
-    return service, warnings
+
+    from rangefinder.capture.posture import CaptureReport
+
+    report = CaptureReport(target=f"{host} ({zone})", perspective="external DNS client",
+                           protocol="dns")
+    report.measured("zone", zone, "queried")
+    report.measured("records", len(records), "via AXFR" if axfr else "via probing")
+    # AXFR being permitted is itself a finding, and one the twin must reproduce faithfully.
+    report.measured("axfr_allowed", axfr, "zone transfer " + ("permitted" if axfr else "refused"))
+    if not axfr:
+        report.unmeasurable("full_zone", "partial",
+                            "AXFR refused, so the zone was reconstructed by probing common names; "
+                            "records outside that probe set were not captured.")
+    return service, warnings, report
 
 
 def _collect(fqdn: str, rds, add) -> None:
@@ -109,12 +128,18 @@ def _value(rtype: str, rdata) -> str | None:
         return rdata.address
     if rtype == "CNAME":
         return str(rdata.target).rstrip(".")
+    if rtype == "NS":
+        return str(rdata.target).rstrip(".")
     if rtype == "MX":
         return f"{rdata.preference} {str(rdata.exchange).rstrip('.')}"
     if rtype == "SRV":
         return f"{rdata.priority} {rdata.weight} {rdata.port} {str(rdata.target).rstrip('.')}"
     if rtype == "TXT":
         return b"".join(rdata.strings).decode("utf-8", "replace")
+    if rtype == "SOA":
+        # "<mname> <rname> <serial> <refresh> <retry> <expire> <minimum>" — brackets an AXFR.
+        return (f"{str(rdata.mname).rstrip('.')} {str(rdata.rname).rstrip('.')} "
+                f"{rdata.serial} {rdata.refresh} {rdata.retry} {rdata.expire} {rdata.minimum}")
     return None
 
 

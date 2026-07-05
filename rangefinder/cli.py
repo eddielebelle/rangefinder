@@ -217,13 +217,14 @@ def cmd_gen(args) -> int:
 def cmd_capture(args) -> int:
     from urllib.parse import urlparse
 
-    capture_report = None  # only the smb captor produces a posture report today
+    capture_report = None  # every captor returns a provenance report; written as a sidecar below
 
     if args.captor == "http":
         from rangefinder.capture import capture_http
 
         try:
-            service, warnings = capture_http(args.url, max_paths=args.max, scrub=args.scrub)
+            service, warnings, capture_report = capture_http(
+                args.url, max_paths=args.max, scrub=args.scrub)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ERROR
@@ -238,7 +239,7 @@ def cmd_capture(args) -> int:
         tls = args.tls or parsed.scheme == "ldaps"
         port = args.port or parsed.port or (636 if tls else 389)
         try:
-            service, warnings = capture_ldap(
+            service, warnings, capture_report = capture_ldap(
                 hostname, port, tls=tls, bind_dn=args.bind_dn,
                 password=args.password, scrub=args.scrub,
             )
@@ -266,7 +267,8 @@ def cmd_capture(args) -> int:
 
         hostname = args.host
         try:
-            service, warnings = capture_dns(hostname, args.port, zone=args.zone, scrub=args.scrub)
+            service, warnings, capture_report = capture_dns(
+                hostname, args.port, zone=args.zone, scrub=args.scrub)
         except (ValueError, OSError) as exc:
             print(f"error: DNS capture failed: {exc}", file=sys.stderr)
             return EXIT_ERROR
