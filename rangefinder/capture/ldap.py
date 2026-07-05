@@ -40,8 +40,10 @@ def capture_ldap(
     timeout: float = 5.0,
     max_entries: int = 5000,
     scrub: bool = False,
-) -> tuple[dict, list[str]]:
-    """Bind, enumerate, and return (ldap_service_config, warnings)."""
+) -> tuple[dict, list[str], "CaptureReport"]:
+    """Bind, enumerate, and return (ldap_service_config, warnings, capture_report)."""
+    from rangefinder.capture.posture import CaptureReport
+
     warnings: list[str] = []
     scrubber = Scrubber() if scrub else None
     sock = socket.create_connection((host, port), timeout)
@@ -108,7 +110,25 @@ def capture_ldap(
     service["entries"] = entries
 
     warnings.append(f"captured {len(entries) - 1} entries under {base_dn or '(unknown base)'}")
-    return service, warnings
+
+    anonymous = bind_dn == ""
+    perspective = "anonymous bind" if anonymous else f"authenticated as {bind_dn!r}"
+    report = CaptureReport(target=host, perspective=perspective, protocol="ldap")
+    report.measured("tls", tls, "LDAPS" if tls else "plaintext ldap")
+    report.measured("base_dn", base_dn or "(unknown)", "RootDSE namingContexts")
+    report.measured("entries", len(entries) - 1, "readable at this bind")
+    if anonymous:
+        # We bound anonymously and it returned data -> anonymous bind is genuinely allowed.
+        report.measured("allow_anonymous_bind", True, "anonymous bind succeeded and returned data")
+        report.unmeasurable("authenticated_directory", "unknown",
+                            "captured anonymously; entries/attributes visible only to an "
+                            "authenticated bind were not measured. Re-capture with -D/-w.")
+    else:
+        # Captured with credentials: whether *anonymous* bind is allowed was never tested, so the
+        # twin fails closed (denies anon) — restrictive, but flagged as an assumption to confirm.
+        report.assumed("allow_anonymous_bind", False,
+                       "not tested at this credentialed capture; assumed denied (fail-closed)")
+    return service, warnings, report
 
 
 # ------------------------------------------------------------------------ ldap client

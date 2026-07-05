@@ -28,8 +28,9 @@ _SRV = ["_ldap._tcp", "_kerberos._tcp", "_kerberos._udp", "_gc._tcp", "_kpasswd.
 
 
 def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
-                names: list[str] | None = None, scrub: bool = False) -> tuple[dict, list[str]]:
-    """Enumerate a zone and return (dns_service_config, warnings)."""
+                names: list[str] | None = None,
+                scrub: bool = False) -> tuple[dict, list[str], "CaptureReport"]:
+    """Enumerate a zone and return (dns_service_config, warnings, capture_report)."""
     import dns.exception
     import dns.flags
     import dns.message
@@ -88,7 +89,20 @@ def capture_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0,
                      "autofill_hosts": False, "records": records}
     warnings.append(f"captured {len(records)} record(s) for {zone}"
                     + (" via AXFR" if axfr else " via probing"))
-    return service, warnings
+
+    from rangefinder.capture.posture import CaptureReport
+
+    report = CaptureReport(target=f"{host} ({zone})", perspective="external DNS client",
+                           protocol="dns")
+    report.measured("zone", zone, "queried")
+    report.measured("records", len(records), "via AXFR" if axfr else "via probing")
+    # AXFR being permitted is itself a finding, and one the twin must reproduce faithfully.
+    report.measured("axfr_allowed", axfr, "zone transfer " + ("permitted" if axfr else "refused"))
+    if not axfr:
+        report.unmeasurable("full_zone", "partial",
+                            "AXFR refused, so the zone was reconstructed by probing common names; "
+                            "records outside that probe set were not captured.")
+    return service, warnings, report
 
 
 def _collect(fqdn: str, rds, add) -> None:

@@ -165,7 +165,7 @@ def verify_http(url: str, *, max_paths: int = 200, timeout: float = 5.0,
                 nmap: bool = False) -> VerifyReport:
     from rangefinder.capture.http import _KEEP_HEADERS, _build_opener, _fetch, capture_http
 
-    service, warnings = capture_http(url, max_paths=max_paths, scrub=False, timeout=timeout)
+    service, warnings, _ = capture_http(url, max_paths=max_paths, scrub=False, timeout=timeout)
     report = VerifyReport("http", url, warnings=list(warnings))
 
     parsed = urlparse(url if "://" in url else "http://" + url)
@@ -284,15 +284,15 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
                 password: str = "", timeout: float = 5.0) -> VerifyReport:
     from rangefinder.capture.ldap import capture_ldap
 
-    service, warnings = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
+    service, warnings, _ = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
                                      password=password, timeout=timeout, scrub=False)
     report = VerifyReport("ldap", f"{host}:{port}", warnings=list(warnings))
     real = {e["dn"]: e["attributes"] for e in service["entries"]}
 
     with _ServedFacade(service) as srv:
         # Enumerate the replica through the facade's own rendering, same access level.
-        repl_service, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
-                                       password=password, timeout=timeout, scrub=False)
+        repl_service, _, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
+                                          password=password, timeout=timeout, scrub=False)
         time.sleep(0.1)
         det_events = srv.events
     repl = {e["dn"]: e["attributes"] for e in repl_service["entries"]}
@@ -430,7 +430,7 @@ def _recapture_smb(host, port, username, password, domain, timeout, attempts: in
 def verify_dns(host: str, port: int = 53, *, zone: str, timeout: float = 5.0) -> VerifyReport:
     from rangefinder.capture.dns import _server_ip, capture_dns
 
-    service, warnings = capture_dns(host, port, zone=zone, timeout=timeout, scrub=False)
+    service, warnings, _ = capture_dns(host, port, zone=zone, timeout=timeout, scrub=False)
     report = VerifyReport("dns", f"{host}:{port} ({zone})", warnings=list(warnings))
     queries = sorted({(r["name"], r["type"]) for r in service["records"]})
     if not queries:

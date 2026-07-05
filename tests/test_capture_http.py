@@ -45,7 +45,7 @@ async def _capture(**kw):
 
 
 def test_capture_reproduces_exposures_verbatim():
-    service, _ = asyncio.run(_capture())
+    service, warnings, report = asyncio.run(_capture())
     # emitted config is a valid http service
     RangeConfig.model_validate({
         "name": "t", "network": {"subnet": "10.0.0.0/24"},
@@ -53,6 +53,12 @@ def test_capture_reproduces_exposures_verbatim():
     })
     assert service["type"] == "http"
     assert service["server_header"] == "nginx/1.18.0 (Ubuntu)"
+
+    # every captor now returns a provenance report (shared framework, not smb-only)
+    assert report.protocol == "http"
+    status = {i.field: i.status for i in report.items}
+    assert status.get("server_header") == "measured"
+    assert status.get("tls") == "measured"
 
     paths = service["paths"]
     # exposure carried through with no git-specific code
@@ -64,7 +70,7 @@ def test_capture_reproduces_exposures_verbatim():
 
 
 def test_scrub_redacts_secrets_but_keeps_route():
-    service, _ = asyncio.run(_capture(scrub=True))
+    service, *_ = asyncio.run(_capture(scrub=True))
     leak = service["paths"]["/config.json"]["body"]
     assert "Sup3rSecret" not in leak
     assert "REDACTED" in leak
@@ -73,5 +79,5 @@ def test_scrub_redacts_secrets_but_keeps_route():
 
 
 def test_verbatim_keeps_secrets():
-    service, _ = asyncio.run(_capture())
+    service, *_ = asyncio.run(_capture())
     assert "Sup3rSecret" in service["paths"]["/config.json"]["body"]

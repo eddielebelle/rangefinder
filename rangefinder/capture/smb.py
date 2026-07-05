@@ -20,8 +20,8 @@ without bloating the config. ``scrub=True`` redacts secrets in captured text.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
 
+from rangefinder.capture.posture import CaptureReport, PostureItem
 from rangefinder.capture.scrub import Scrubber
 
 # Shares that are administrative / non-file — skip (a null session can't read them anyway).
@@ -34,67 +34,6 @@ _DIALECT_NAME = {0x0202: "2.0.2", 0x0210: "2.1", 0x0300: "3.0", 0x0302: "3.0", 0
 # guest-mapping host accepts it). No randomness needed — the point is that it does not exist.
 _PROBE_USER = "rangefinder_probe"
 _PROBE_PASS = "rf-not-a-real-password"
-
-
-@dataclass
-class PostureItem:
-    """One security-relevant fact about the captured host, with its provenance.
-
-    status is the confidence tier the capture report groups by:
-      measured      — actively probed against the real host; captured truth that transfers.
-      assumed       — could not measure; the facade uses a FAIL-CLOSED default and says so here.
-      unmeasurable  — the answer only exists from an access level the capture did not have
-                      (e.g. an authenticated read when captured anonymously); needs a decision.
-    """
-
-    field: str
-    status: str
-    value: str
-    note: str = ""
-
-
-@dataclass
-class CaptureReport:
-    """Provenance for a capture: which posture facts are measured vs assumed vs unmeasurable.
-
-    Written alongside the config as a ``*.capture-report.md`` sidecar so a reviewer can see
-    exactly what the twin reproduces from measurement and what it merely assumes.
-    """
-
-    target: str
-    perspective: str
-    items: list[PostureItem] = field(default_factory=list)
-
-    def _tier(self, status: str) -> list[PostureItem]:
-        return [i for i in self.items if i.status == status]
-
-    def to_markdown(self) -> str:
-        lines = [f"# Capture report — {self.target}",
-                 f"_Perspective: {self.perspective}_", ""]
-        tiers = [
-            ("✓ MEASURED", "measured",
-             "captured truth — transfers to the real host"),
-            ("⚠ ASSUMED", "assumed",
-             "could not measure — fail-closed default in use; CONFIRM against the real host"),
-            ("✗ UNMEASURABLE at this access level", "unmeasurable",
-             "no default can be right — decide, or re-capture with the access level named"),
-        ]
-        for title, status, blurb in tiers:
-            items = self._tier(status)
-            lines.append(f"## {title}")
-            lines.append(f"_{blurb}_")
-            if not items:
-                lines.append("\n- (none)\n")
-                continue
-            lines.append("")
-            width = max(len(i.field) for i in items)
-            for i in items:
-                row = f"- `{i.field.ljust(width)}`  {i.value}"
-                if i.note:
-                    row += f"  — {i.note}"
-                lines.append(row)
-            lines.append("")
-        return "\n".join(lines)
 
 
 def capture_smb(
@@ -131,7 +70,7 @@ def capture_smb(
     want = {s.strip().lower() for s in shares} if shares else None
     anonymous = not username  # null session: denials become restrict_anonymous, not empty shares
     perspective = "anonymous / null session" if anonymous else f"authenticated as {username!r}"
-    report = CaptureReport(target=host, perspective=perspective)
+    report = CaptureReport(target=host, perspective=perspective, protocol="smb")
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)

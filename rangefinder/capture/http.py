@@ -58,8 +58,9 @@ def capture_http(
     scrub: bool = False,
     timeout: float = 5.0,
     insecure: bool = True,
-) -> tuple[dict, list[str]]:
-    """Probe *base_url* and return (http_service_config, warnings)."""
+) -> tuple[dict, list[str], "CaptureReport"]:
+    """Probe *base_url* and return (http_service_config, warnings, capture_report)."""
+    from rangefinder.capture.posture import CaptureReport
     parsed = urlparse(base_url if "://" in base_url else "http://" + base_url)
     scheme = parsed.scheme or "http"
     netloc = parsed.netloc
@@ -117,7 +118,22 @@ def capture_http(
         service["paths"] = routes
 
     warnings.append(f"captured {len(routes)} live route(s) from {base} ({probed} probed)")
-    return service, warnings
+
+    report = CaptureReport(target=netloc or base, perspective="unauthenticated HTTP client",
+                           protocol="http")
+    report.measured("tls", tls, "https" if tls else "plaintext")
+    if server_header:
+        report.measured("server_header", apply(scrubber, server_header), "Server response header")
+    report.measured("routes", f"{len(routes)} live", f"{probed} paths probed")
+    report.measured("default_status", default_status, "response to an unknown path")
+    # Auth-gated routes prove a boundary exists; what sits *behind* it is another perspective.
+    gated = sorted(p for p, r in routes.items() if r.get("status") in (401, 403))
+    if gated:
+        report.unmeasurable("authenticated_content", f"{len(gated)} gated route(s)",
+                            "captured unauthenticated; content behind "
+                            + ", ".join(gated[:3]) + (" …" if len(gated) > 3 else "")
+                            + " not measured. Re-capture with credentials to reach it.")
+    return service, warnings, report
 
 
 def _route(resp: _Resp, scrubber: Scrubber | None) -> dict:

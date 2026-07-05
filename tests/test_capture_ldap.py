@@ -35,10 +35,17 @@ async def _capture_from_live_facade(scrub=False):
 
 
 def test_capture_records_directory():
-    service, warnings = asyncio.run(_capture_from_live_facade())
+    service, warnings, report = asyncio.run(_capture_from_live_facade())
     assert service["type"] == "ldap"
     assert service["allow_anonymous_bind"] is True
     assert service["base_dn"] == "DC=corp,DC=local"
+
+    # provenance: anonymous bind is a measured fact, and the authenticated view is surfaced as
+    # unmeasurable (the same fail-closed/surface discipline as SMB, now protocol-agnostic).
+    assert report.protocol == "ldap"
+    status = {i.field: i.status for i in report.items}
+    assert status.get("allow_anonymous_bind") == "measured"
+    assert any(i.status == "unmeasurable" and "authenticated" in i.field for i in report.items)
 
     # RootDSE captured as dn ""
     assert any(e["dn"] == "" for e in service["entries"])
@@ -49,7 +56,7 @@ def test_capture_records_directory():
 
 
 def test_captured_config_replays_faithfully():
-    service, _ = asyncio.run(_capture_from_live_facade())
+    service, *_ = asyncio.run(_capture_from_live_facade())
     # Build a fresh facade from the captured entries (no identities) and confirm it
     # serves the same directory.
     ctx, _ = make_ctx()
@@ -63,7 +70,7 @@ def test_captured_config_replays_faithfully():
 
 
 def test_scrub_redacts_secret_attributes():
-    service, _ = asyncio.run(_capture_from_live_facade(scrub=True))
+    service, *_ = asyncio.run(_capture_from_live_facade(scrub=True))
     user = next(e for e in service["entries"] if e["attributes"].get("sAMAccountName") == ["svc-x"])
     desc = user["attributes"]["description"][0]
     assert "Pass123" not in desc
