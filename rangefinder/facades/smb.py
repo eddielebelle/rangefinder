@@ -10,9 +10,11 @@ thread and bridges lifecycle to the asyncio supervisor. Telemetry is derived by 
 a logging handler to impacket's server logger and translating its records into ECS events
 (the log stream is otherwise suppressed so it never pollutes the JSON telemetry on stdout).
 
-Deliberate limits: `readonly` is advisory (not enforced); one SMB facade per host is
-assumed (the log handler is process-wide). It renders shares for enumeration; it is not a
-hardened file server.
+Fidelity of the access surface: `readonly` shares reject writes with STATUS_ACCESS_DENIED
+(impacket enforces `read only`), IPC$ is re-pointed off the process CWD so it can't leak the
+container's install tree, and a share captured as `restrict_anonymous` is enumerable but
+refuses a null-session tree connect — so a captured access decision is reproduced rather than
+served wide open. One SMB facade per host is assumed (the log handler is process-wide).
 """
 
 from __future__ import annotations
@@ -163,6 +165,7 @@ class SmbFacade(Facade):
         # advances while ServerStartTime stays put (real uptime), not "booted this instant".
         self._server_guid, self._uptime_offset = _server_identity(ctx.host_name)
         self._boot_epoch: float | None = None
+        self._restricted: set[str] = set()
 
     @classmethod
     def from_config(cls, cfg: SmbConfig, ctx: FacadeContext) -> "SmbFacade":
@@ -190,11 +193,17 @@ class SmbFacade(Facade):
         inner._SMBSERVER__serverOS = self.cfg.server_os
         inner._SMBSERVER__serverName = self.ctx.host_name.upper()
         self._boot_epoch = time.time() - self._uptime_offset
+        self._neuter_ipc_share(srv, inner)
         self._install_negotiate_realism(inner)
+        # Shares a null/anonymous session must be refused (enumerable, not readable). Compared
+        # case-insensitively in the tree-connect hook.
+        self._restricted = {s.name.upper() for s in self.cfg.shares if s.restrict_anonymous}
+        self._install_access_control(inner)
 
         for share in self.cfg.shares:
             path = self._materialize(share)
-            srv.addShare(share.name, path, share.comment)
+            srv.addShare(share.name, path, share.comment,
+                         readOnly="yes" if share.readonly else "no")
 
         # NTLM validation: register each identities account's NT hash. impacket then
         # validates authenticated logons (pass-the-hash succeeds with the right hash, wrong
@@ -285,6 +294,78 @@ class SmbFacade(Facade):
             return result
 
         inner.hookSmb2Command(smb2.SMB2_NEGOTIATE, _hook)
+
+    # ---- IPC$ containment -------------------------------------------------------
+    def _neuter_ipc_share(self, srv, inner) -> None:
+        """Stop IPC$ directory listing from serving the process working directory.
+
+        impacket's IPC$ section has an empty ``path``; a client that tree-connects IPC$ and lists
+        it hits ``os.path.normpath('') == '.'`` in the query-directory handler and browses the
+        server's CWD (inside the container, ``/app`` — leaking the rangefinder install and its
+        provenance). The path must stay empty or the srvsvc/wkssvc named pipes (share enumeration
+        rides them) stop resolving. So instead we hook SMB2_QUERY_DIRECTORY: an enumeration of the
+        IPC$ tree returns no entries, as a real pipe share does, while pipe opens are untouched.
+        """
+        from impacket import smb3structs as smb2
+        from impacket.nt_errors import STATUS_NO_SUCH_FILE
+
+        original = inner.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, None)
+
+        def _hook(conn_id, smb_server, recv_packet):
+            try:
+                conn = smb_server.getConnectionData(conn_id)
+                share = conn.get("ConnectedShares", {}).get(recv_packet["TreeID"], {})
+                if (share.get("shareName") or "").upper() == "IPC$":
+                    return [smb2.SMB2Error()], None, STATUS_NO_SUCH_FILE
+            except Exception:
+                pass
+            return original(conn_id, smb_server, recv_packet)
+
+        inner.hookSmb2Command(smb2.SMB2_QUERY_DIRECTORY, _hook)
+
+    # ---- access control ---------------------------------------------------------
+    def _install_access_control(self, inner) -> None:
+        """Refuse anonymous tree connects to shares captured as not readable by a null session.
+
+        Real servers commonly enumerate share names to a null session yet deny that session
+        access to the contents. impacket lets any session (including anonymous) connect and read
+        every share, so a share captured as access-denied would otherwise be served wide open —
+        exactly the false-positive that makes an agent's finding fail to transfer. This wraps
+        SMB2_TREE_CONNECT: a null/guest session connecting a restricted share gets
+        STATUS_ACCESS_DENIED (the share still appears in enumeration); authenticated sessions are
+        unaffected.
+        """
+        if not self._restricted:
+            return
+        from impacket import smb3structs as smb2
+        from impacket.nt_errors import STATUS_ACCESS_DENIED
+
+        original = inner.hookSmb2Command(smb2.SMB2_TREE_CONNECT, None)
+        restricted = self._restricted
+
+        def _hook(conn_id, smb_server, recv_packet):
+            result = original(conn_id, smb_server, recv_packet)
+            try:
+                conn = smb_server.getConnectionData(conn_id)
+                # An authenticated user (non-empty user_name) keeps normal access; a null/guest
+                # session has no user_name and is the one we gate.
+                if conn.get("user_name"):
+                    return result
+                resp = result[1][0]
+                tid = int(resp["TreeID"])
+                shares = conn.get("ConnectedShares", {})
+                share_name = (shares.get(tid, {}).get("shareName") or "").upper()
+                if share_name in restricted:
+                    shares.pop(tid, None)  # undo the connect impacket just granted
+                    smb_server.setConnectionData(conn_id, conn)
+                    resp["Status"] = STATUS_ACCESS_DENIED
+                    resp["Data"] = smb2.SMB2Error()
+                    return result[0], [resp], STATUS_ACCESS_DENIED
+            except Exception:
+                pass
+            return result
+
+        inner.hookSmb2Command(smb2.SMB2_TREE_CONNECT, _hook)
 
     # ---- backing files ----------------------------------------------------------
     def _materialize(self, share: SmbShare) -> str:

@@ -6,6 +6,12 @@ them as real backing files — so if a share is null-session readable on the rea
 is on the replica, with the same tree. No misconfig detection: the exposure is whatever the
 capture could reach.
 
+The access *decision* is recorded too, not just the readable files. A share that enumerates
+but refuses a null session (STATUS_ACCESS_DENIED on listing) is marked ``restrict_anonymous``
+so the twin reproduces the denial — otherwise it would serve an empty share wide open and an
+agent would report a write/read exposure that does not exist on the real server. The server's
+signing posture (``signing_required``) is captured for the same reason.
+
 Uses impacket's SMB client (already a dependency). Text files are captured verbatim; binary
 and oversized files are recorded by name with a placeholder so the tree stays faithful
 without bloating the config. ``scrub=True`` redacts secrets in captured text.
@@ -42,15 +48,21 @@ def capture_smb(
     restricts the capture to named shares (case-insensitive) — target the ones that matter and
     skip media/photo shares that are all placeholders anyway.
     """
-    from impacket.smbconnection import SMBConnection
+    from impacket.smbconnection import SMBConnection, SessionError
+    from impacket.nt_errors import STATUS_ACCESS_DENIED
 
     warnings: list[str] = []
     scrubber = Scrubber() if scrub else None
     want = {s.strip().lower() for s in shares} if shares else None
+    anonymous = not username  # null session: denials become restrict_anonymous, not empty shares
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)
         server_os = conn.getServerOS() or "Windows"
+        try:
+            signing_required = bool(conn.isSigningRequired())
+        except Exception:
+            signing_required = False
         shares_cfg: list[dict] = []
         overall = _Budget(max_files)
         seen: set[str] = set()
@@ -66,13 +78,26 @@ def capture_smb(
 
             files: dict[str, str] = {}
             per_share = _Budget(max_files_per_share)
+            denied = False
             try:
                 _walk(conn, name, "", files, _Pair(per_share, overall), max_file_size,
                       scrubber, warnings)
-            except Exception as exc:  # access denied / not a disk share
+            except SessionError as exc:
+                if exc.getErrorCode() == STATUS_ACCESS_DENIED:
+                    denied = True
+                    warnings.append(f"share {name!r}: access denied at this access level "
+                                    f"(recorded as enumerable, not readable)")
+                else:
+                    warnings.append(f"share {name!r}: not fully readable ({exc})")
+            except Exception as exc:  # not a disk share / transient error
                 warnings.append(f"share {name!r}: not fully readable at this access level ({exc})")
 
             entry: dict = {"name": name, "comment": comment, "readonly": True}
+            # A null session that was refused read access is a faithful "enumerable but not
+            # readable" share: mark it so the twin reproduces the denial rather than serving an
+            # empty share wide open. (With credentials, a denial can't be modelled as anonymous.)
+            if denied and anonymous and not files:
+                entry["restrict_anonymous"] = True
             if files:
                 entry["files"] = files
             shares_cfg.append(entry)
@@ -91,7 +116,8 @@ def capture_smb(
         except Exception:
             pass
 
-    service: dict = {"type": "smb", "port": port, "server_os": server_os, "shares": shares_cfg}
+    service: dict = {"type": "smb", "port": port, "server_os": server_os,
+                     "signing_required": signing_required, "shares": shares_cfg}
     total = sum(len(s.get("files", {})) for s in shares_cfg)
     warnings.append(f"captured {len(shares_cfg)} share(s), {total} file(s) from {host}")
     return service, warnings

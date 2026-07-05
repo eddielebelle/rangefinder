@@ -169,6 +169,12 @@ class SmbShare(BaseModel):
     name: str
     comment: str = ""
     readonly: bool = True
+    # Faithful access model. A real server enumerates its share names to a null session but may
+    # deny that session read access to the share's contents. When True, the share is listed by
+    # ``smbclient -L`` / NetrShareEnum (enumeration transfers) but a null/anonymous tree connect
+    # is refused with STATUS_ACCESS_DENIED — so the twin reproduces the captured access decision
+    # instead of serving the (empty, because unreadable at capture time) share wide open.
+    restrict_anonymous: bool = False
     files: dict[str, str] = Field(default_factory=dict)
 
 
