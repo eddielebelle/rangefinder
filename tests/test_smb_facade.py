@@ -340,6 +340,124 @@ def test_backing_file_mtimes_backdated_and_varied(tmp_path):
     assert (now - os.stat(share_dir).st_mtime) > 86400        # directory backdated as well
 
 
+# ------------------------------------------------------- access-surface fidelity
+
+
+def _serve_shares(shares, hostname="fs01"):
+    cfg = SmbConfig(port=_free_port(), shares=shares)
+    facade = _serve(cfg, hostname)
+    facade.port = cfg.port
+    return facade, cfg.port
+
+
+def test_readonly_share_rejects_anonymous_write():
+    """A readonly share must reject writes with ACCESS_DENIED — not silently accept a file
+    drop. Serving captured shares open to anonymous write is the false-CRITICAL the twin eval
+    surfaced (real servers deny it)."""
+    import io
+
+    def client(port, share):
+        from impacket.smbconnection import SMBConnection
+
+        c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+        c.login("", "")  # null session
+        try:
+            c.putFile(share, "canary.txt", io.BytesIO(b"owned").read)
+            return "written"
+        except Exception as exc:
+            return type(exc).__name__ + ":" + str(exc)
+        finally:
+            c.close()
+
+    async def run(readonly):
+        shares = [SmbShare(name="drop", readonly=readonly, files={"a.txt": "x"})]
+        facade, port = _serve_shares(shares)
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, port, "drop")
+        finally:
+            await facade.stop()
+
+    ro = asyncio.run(run(True))
+    rw = asyncio.run(run(False))
+    assert "ACCESS_DENIED" in ro          # readonly => write refused, the faithful behaviour
+    assert rw == "written"                # readonly=False => write accepted (control)
+
+
+def test_ipc_share_does_not_serve_working_directory():
+    """IPC$ must not browse the process CWD (inside the container, /app — leaking the
+    rangefinder install and provenance). It is re-pointed at an empty jail dir."""
+    def client(port):
+        from impacket.smbconnection import SMBConnection
+
+        c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+        c.login("", "")
+        try:
+            names = {f.get_longname() for f in c.listPath("IPC$", "*")}
+        except Exception as exc:
+            names = {"__error__:" + type(exc).__name__}
+        finally:
+            c.close()
+        return names
+
+    async def run():
+        facade, port = _serve_shares([SmbShare(name="Data", files={"a.txt": "x"})])
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, port)
+        finally:
+            await facade.stop()
+
+    names = asyncio.run(run())
+    # The repo root (this test's CWD) has these; they must NOT leak through IPC$.
+    assert "pyproject.toml" not in names
+    assert "rangefinder" not in names
+    assert names <= {".", ".."} or all(n.startswith("__error__") for n in names)
+
+
+def test_restrict_anonymous_share_enumerable_but_not_connectable():
+    """A restrict_anonymous share is listed to a null session (enumeration transfers) but a
+    null-session tree connect is refused — reproducing 'enumerable, not readable' instead of
+    serving the share wide open (the eval's core faithfulness gap)."""
+    def client(port):
+        from impacket.smbconnection import SMBConnection
+
+        c = SMBConnection("127.0.0.1", "127.0.0.1", sess_port=port)
+        c.login("", "")  # null session
+        shares = {s["shi1_netname"][:-1].upper() for s in c.listShares()}
+        try:
+            c.connectTree("Private")
+            connect = "granted"
+        except Exception as exc:
+            connect = "denied:" + str(exc)
+        # a normal share is still reachable in the same session
+        try:
+            c.connectTree("Public")
+            public = "granted"
+        except Exception as exc:
+            public = "denied:" + str(exc)
+        c.close()
+        return shares, connect, public
+
+    async def run():
+        shares = [
+            SmbShare(name="Public", files={"hello.txt": "hi"}),
+            SmbShare(name="Private", restrict_anonymous=True),
+        ]
+        facade, port = _serve_shares(shares)
+        await facade.start()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, client, port)
+        finally:
+            await facade.stop()
+
+    shares, connect, public = asyncio.run(run())
+    assert "PRIVATE" in shares            # enumerable (the one finding that transfers)
+    assert "PUBLIC" in shares
+    assert "ACCESS_DENIED" in connect     # but a null session cannot connect it
+    assert public == "granted"            # normal shares unaffected
+
+
 def test_select_dialect_ignores_negotiate_context_noise():
     """A 3.1.1 request trails negotiate-context bytes after the dialect array; parsing must
     honour DialectCount so those bytes aren't misread as bogus dialects (and picked)."""

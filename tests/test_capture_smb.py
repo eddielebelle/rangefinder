@@ -120,6 +120,39 @@ def test_per_share_budget_does_not_starve_other_shares():
     assert any("IT" in w and "truncated" in w for w in warnings)
 
 
+def test_capture_records_restrict_anonymous_for_denied_share():
+    # A share a null session can enumerate but not read must come back marked restrict_anonymous
+    # (enumerable, not readable) — not as an empty, wide-open share.
+    ctx, _ = make_ctx()
+    port = _free_port()
+    cfg = SmbConfig(
+        port=port,
+        shares=[
+            SmbShare(name="Public", files={"hi.txt": "hello"}),
+            SmbShare(name="Private", restrict_anonymous=True),
+        ],
+    )
+    facade = SmbFacade.from_config(cfg, ctx)
+    facade.bind_host = "127.0.0.1"
+    facade.port = port
+
+    async def run():
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, lambda: capture_smb("127.0.0.1", port))
+        finally:
+            await facade.stop()
+
+    service, warnings = asyncio.run(run())
+    shares = {s["name"].upper(): s for s in service["shares"]}
+    assert shares["PRIVATE"].get("restrict_anonymous") is True   # denial recorded faithfully
+    assert "files" not in shares["PRIVATE"]                      # nothing readable captured
+    assert shares["PUBLIC"].get("restrict_anonymous") in (None, False)
+    assert "signing_required" in service                         # signing posture captured
+    assert any("private" in w.lower() and "access denied" in w for w in warnings)
+
+
 def test_scrub_redacts_file_contents():
     service, _ = asyncio.run(_capture(scrub=True))
     it = next(s for s in service["shares"] if s["name"] == "IT")
