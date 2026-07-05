@@ -157,6 +157,15 @@ def main(argv: list[str] | None = None) -> int:
     p_v_ssh.add_argument("--port", type=int, default=22)
     p_v_ssh.add_argument("--json", action="store_true", help="emit the report as JSON")
 
+    p_merge = sub.add_parser(
+        "merge", help="merge captured single-service configs into one estate twin")
+    p_merge.add_argument("configs", nargs="+", type=Path,
+                         help="range config JSONs to merge (e.g. per-service captures)")
+    p_merge.add_argument("-o", "--out", type=Path, default=None)
+    p_merge.add_argument("--name", default=None, help="range name for the merged config")
+    p_merge.add_argument("--subnet", default=None,
+                         help="subnet for the merged range (default: derived from host IPs)")
+
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
 
@@ -170,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         "gen": cmd_gen,
         "import": cmd_import,
         "capture": cmd_capture,
+        "merge": cmd_merge,
         "score": cmd_score,
         "detect": cmd_detect,
         "verify": cmd_verify,
@@ -307,12 +317,7 @@ def cmd_capture(args) -> int:
         print(f"error: captured config is invalid: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    text = json.dumps(config, indent=2) + "\n"
-    if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        print(f"wrote {args.out}", file=sys.stderr)
-    else:
-        sys.stdout.write(text)
+    _emit_config(json.dumps(config, indent=2) + "\n", args.out)
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
 
@@ -326,6 +331,15 @@ def cmd_capture(args) -> int:
             sidecar.write_text(capture_report.to_markdown(), encoding="utf-8")
             print(f"wrote {sidecar}", file=sys.stderr)
     return EXIT_OK
+
+
+def _emit_config(text: str, out) -> None:
+    """Write a generated config to *out* (announcing it on stderr) or to stdout."""
+    if out:
+        Path(out).write_text(text, encoding="utf-8")
+        print(f"wrote {out}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
 
 
 def _print_capture_report(report) -> None:
@@ -367,6 +381,73 @@ def _capture_config(service, hostname, args, warnings, default_id) -> dict:
     }
 
 
+def cmd_merge(args) -> int:
+    from rangefinder.orchestrate.merge import merge_configs
+
+    # Load each input through the normal loader so a bad fragment reports a friendly, located
+    # error; dump back to a plain dict (IPs -> str, defaults filled) for the pure merger.
+    dumped: list[dict] = []
+    for path in args.configs:
+        try:
+            cfg = load_config(path)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_CONFIG
+        dumped.append(cfg.model_dump(mode="json", exclude_none=True))
+
+    try:
+        merged, warnings = merge_configs(dumped, name=args.name, subnet=args.subnet)
+    except ValueError as exc:
+        print(f"error: merge failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        RangeConfig.model_validate(merged)
+    except Exception as exc:
+        print(f"error: merged config is invalid: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    _emit_config(json.dumps(merged, indent=2) + "\n", args.out)
+    for w in warnings:
+        print(f"note: {w}", file=sys.stderr)
+
+    # Stitch the inputs' provenance sidecars into one, so the merged twin keeps the
+    # measured/assumed/unmeasurable tiering rather than losing it in the join. Write it beside the
+    # config when there is one; otherwise surface it on stderr so stdout mode doesn't drop it.
+    combined = _combined_capture_report(args.configs)
+    if combined:
+        if args.out:
+            sidecar = Path(args.out).with_suffix(".capture-report.md")
+            sidecar.write_text(combined, encoding="utf-8")
+            print(f"wrote {sidecar}", file=sys.stderr)
+        else:
+            print(combined, file=sys.stderr)
+    return EXIT_OK
+
+
+def _combined_capture_report(config_paths) -> str:
+    """Concatenate each input's sibling ``*.capture-report.md`` under a per-source heading.
+
+    A source without a sidecar (hand-authored config, or the sidecar wasn't co-located) gets an
+    explicit "provenance unknown" section rather than being silently omitted — the merged report
+    must not imply it covers the whole estate when a source's tiering is missing.
+    """
+    sections: list[str] = []
+    for path in config_paths:
+        sidecar = Path(path).with_suffix(".capture-report.md")
+        if sidecar.exists():
+            sections.append(f"# from {path.name}\n\n{sidecar.read_text(encoding='utf-8').strip()}")
+        else:
+            sections.append(f"# from {path.name}\n\n_No capture-report sidecar found — provenance "
+                            f"unknown for this source (hand-authored, or sidecar not co-located)._")
+    if not sections:
+        return ""
+    header = ("# Merged capture provenance\n\n"
+              "This estate twin was assembled from the sources below; each captured source keeps "
+              "its original measured / assumed / unmeasurable tiering.\n\n---\n\n")
+    return header + "\n\n---\n\n".join(sections) + "\n"
+
+
 def cmd_import(args) -> int:
     if args.importer == "nmap":
         from rangefinder.importers import import_nmap
@@ -379,12 +460,7 @@ def cmd_import(args) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
-        text = json.dumps(config, indent=2) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-            print(f"wrote {args.out}", file=sys.stderr)
-        else:
-            sys.stdout.write(text)
+        _emit_config(json.dumps(config, indent=2) + "\n", args.out)
 
         facades = ", ".join(f"{n}×{t}" for t, n in summary["facades"].items())
         print(
