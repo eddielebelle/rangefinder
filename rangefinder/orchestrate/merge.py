@@ -260,7 +260,7 @@ def _merge_identities(identities_list, warnings):
     base = {**identities_list[0]}
     base["users"] = list(base.get("users", []))
     base["groups"] = list(base.get("groups", []))
-    seen_users = {u.get("sam") for u in base["users"]}
+    users_by_sam = {u.get("sam"): u for u in base["users"]}
     seen_groups = {g.get("name") for g in base["groups"]}
     for extra in identities_list[1:]:
         if extra.get("domain") != base.get("domain"):
@@ -274,9 +274,13 @@ def _merge_identities(identities_list, warnings):
                 f"merge same-domain captures, keeping each domain in its own range"
             )
         for u in extra.get("users", []):
-            if u.get("sam") not in seen_users:
+            sam = u.get("sam")
+            if sam not in users_by_sam:
                 base["users"].append(u)
-                seen_users.add(u.get("sam"))
+                users_by_sam[sam] = u
+            elif u != users_by_sam[sam]:
+                warnings.append(f"identity {sam!r} defined differently across inputs; "
+                                f"kept the first definition and dropped the other")
         for g in extra.get("groups", []):
             if g.get("name") not in seen_groups:
                 base["groups"].append(g)

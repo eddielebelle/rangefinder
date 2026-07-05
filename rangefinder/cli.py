@@ -166,6 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--subnet", default=None,
                          help="subnet for the merged range (default: derived from host IPs)")
 
+    p_coh = sub.add_parser(
+        "coherence", help="check cross-service coherence (credential reuse, leaks, identity gaps)")
+    p_coh.add_argument("config", type=Path)
+    p_coh.add_argument("--strict", action="store_true",
+                       help="exit nonzero if any coherence findings are reported (for CI gating)")
+
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
 
@@ -180,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         "import": cmd_import,
         "capture": cmd_capture,
         "merge": cmd_merge,
+        "coherence": cmd_coherence,
         "score": cmd_score,
         "detect": cmd_detect,
         "verify": cmd_verify,
@@ -197,6 +204,16 @@ def cmd_validate(args) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG
     _print_summary(cfg)
+    # Advisory cross-service coherence: schema-valid configs can still be internally incoherent
+    # (a reused credential, a leaked live secret, a login with no directory identity). Surfaced
+    # here but non-fatal — `rangefinder coherence` is the gate that exits nonzero.
+    from rangefinder.coherence import check_coherence
+
+    coh = check_coherence(cfg)
+    if coh.has_findings:
+        from rangefinder.coherence import format_report
+        print("\ncross-service coherence:", file=sys.stderr)
+        print(format_report(coh), file=sys.stderr)
     return EXIT_OK
 
 
@@ -402,19 +419,32 @@ def cmd_merge(args) -> int:
         return EXIT_ERROR
 
     try:
-        RangeConfig.model_validate(merged)
+        model = RangeConfig.model_validate(merged)
     except Exception as exc:
         print(f"error: merged config is invalid: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    # Cross-service coherence: the join is the first place services coexist, so it's where reuse /
+    # leaked-credential paths first become visible. Advisory (never fatal — a static check can't
+    # certify a semantic contradiction; the structural fail-closed is RangeConfig validation above);
+    # surfaced as notes and folded into the provenance sidecar.
+    from rangefinder.coherence import check_coherence, format_report
+
+    coh = check_coherence(model)
+
     _emit_config(json.dumps(merged, indent=2) + "\n", args.out)
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
+    if coh.has_findings:
+        print("cross-service coherence:", file=sys.stderr)
+        print(format_report(coh), file=sys.stderr)
 
     # Stitch the inputs' provenance sidecars into one, so the merged twin keeps the
     # measured/assumed/unmeasurable tiering rather than losing it in the join. Write it beside the
     # config when there is one; otherwise surface it on stderr so stdout mode doesn't drop it.
     combined = _combined_capture_report(args.configs)
+    if combined and coh.has_findings:
+        combined += f"\n---\n\n# Cross-service coherence\n\n```\n{format_report(coh)}\n```\n"
     if combined:
         if args.out:
             sidecar = Path(args.out).with_suffix(".capture-report.md")
@@ -446,6 +476,23 @@ def _combined_capture_report(config_paths) -> str:
               "This estate twin was assembled from the sources below; each captured source keeps "
               "its original measured / assumed / unmeasurable tiering.\n\n---\n\n")
     return header + "\n\n---\n\n".join(sections) + "\n"
+
+
+def cmd_coherence(args) -> int:
+    from rangefinder.coherence import check_coherence, format_report
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    report = check_coherence(cfg)
+    print(format_report(report))
+    # Advisory by default (findings are observations, not certain contradictions); --strict turns
+    # any finding into a nonzero exit for CI gating.
+    if args.strict and report.has_findings:
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def cmd_import(args) -> int:
