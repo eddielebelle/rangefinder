@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from rangefinder.config.model import RangeConfig
 from rangefinder.config.services import KerberosConfig
@@ -68,6 +69,95 @@ def _secret_id(secret: str) -> str:
     return "secret#" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
 
 
+@lru_cache(maxsize=4096)
+def _leak_pattern(secret: str):
+    return re.compile(r"(?<!\w)" + re.escape(secret) + r"(?!\w)")
+
+
+def leak_contains(secret: str, text: str) -> bool:
+    """Whether *secret* appears as a whole token in *text* — the conservative match coherence and
+    verify both use so a short/common password can't produce a spurious leak hit. The compiled
+    pattern is cached per secret (called once per secret×leak pair on large estates)."""
+    if not secret or len(secret) < _MIN_LEAK_SECRET_LEN:
+        return False
+    return _leak_pattern(secret).search(text) is not None
+
+
+def iter_leaks(cfg: RangeConfig):
+    """Yield ``(text, location)`` for every free-text field a credential can leak into: SMB share
+    comments + files, LDAP entry description/comment/info, HTTP bodies, identity/group descriptions.
+    Shared by check_coherence and verify_estate so both scan exactly the same surfaces."""
+    for host in cfg.hosts:
+        for svc in host.services:
+            where = f"{svc.type}@{host.id}:{svc.port}"
+            if svc.type == "http":
+                if svc.default_body:
+                    yield str(svc.default_body), f"{where} default_body"
+                for path, hp in svc.paths.items():
+                    if hp.body:
+                        yield str(hp.body), f"{where}{path} body"
+            elif svc.type == "smb":
+                for share in svc.shares:
+                    if share.comment:
+                        yield str(share.comment), f"{where}/{share.name} (comment)"
+                    for fname, content in share.files.items():
+                        if content:
+                            yield str(content), f"{where}/{share.name}/{fname}"
+            elif svc.type == "ldap":
+                for entry in svc.entries:
+                    for attr, values in entry.attributes.items():
+                        if attr.lower() in _LEAKY_ATTRS:
+                            for v in values:
+                                if v:
+                                    yield str(v), f"{where} {entry.dn or 'RootDSE'}/{attr}"
+    if cfg.identities:
+        for u in cfg.identities.users:
+            if u.description:
+                yield str(u.description), f"identities:{u.sam}.description"
+        for g in cfg.identities.groups:
+            if g.description:
+                yield str(g.description), f"identities:group:{g.name}.description"
+
+
+def iter_credentials(cfg: RangeConfig):
+    """Yield the concrete login credentials embedded in the config as dicts
+    ``{kind, host_id, port, username, secret, domain, origin, path?}`` — the claims `verify estate`
+    tries against the live estate. A directory account's password is tested against every ldap
+    (bind) and smb (logon) facade in the range; a planted ssh/http login against its own service."""
+    ldap_hosts = [(h, s) for h in cfg.hosts for s in h.services if s.type == "ldap"]
+    smb_hosts = [(h, s) for h in cfg.hosts for s in h.services if s.type == "smb"]
+    for host in cfg.hosts:
+        for svc in host.services:
+            if svc.type == "ssh":
+                for user, pw in svc.accept_creds.items():
+                    if pw:
+                        yield {"kind": "ssh", "host_id": host.id, "port": svc.port,
+                               "username": user, "secret": pw, "domain": "",
+                               "origin": f"ssh accept_creds[{user}]"}
+            elif svc.type == "http":
+                for path, hp in svc.paths.items():
+                    for user, pw in hp.auth_users.items():
+                        if pw:
+                            yield {"kind": "http", "host_id": host.id, "port": svc.port,
+                                   "username": user, "secret": pw, "domain": "", "path": path,
+                                   "origin": f"http {path} auth_users[{user}]"}
+    if cfg.identities:
+        domain = cfg.identities.domain
+        netbios = cfg.identities.netbios or domain
+        for u in cfg.identities.users:
+            if not (u.password and u.enabled):
+                continue
+            dn = u.upn or f"{u.sam}@{domain}"
+            for host, svc in ldap_hosts:
+                yield {"kind": "ldap", "host_id": host.id, "port": svc.port,
+                       "username": dn, "secret": u.password, "domain": "", "tls": svc.tls,
+                       "origin": f"identities:{u.sam}.password"}
+            for host, svc in smb_hosts:
+                yield {"kind": "smb", "host_id": host.id, "port": svc.port,
+                       "username": u.sam, "secret": u.password, "domain": netbios,
+                       "origin": f"identities:{u.sam}.password"}
+
+
 def check_coherence(cfg: RangeConfig) -> CoherenceReport:
     report = CoherenceReport()
 
@@ -75,15 +165,11 @@ def check_coherence(cfg: RangeConfig) -> CoherenceReport:
     # account backed by its own directory entry (1 owner, not reuse).
     secrets: dict[str, list[tuple[str, str]]] = {}
     logins: list[tuple[str, str, str]] = []   # (username, password, location) for backing checks
-    leaks: list[tuple[str, str]] = []         # (leaked_text, location)
+    leaks = list(iter_leaks(cfg))             # (leaked_text, location); shared with verify estate
 
     def add_secret(value: str, owner: str, location: str) -> None:
         if value:  # an empty password is "reject all" / capture-only, not a credential
             secrets.setdefault(value, []).append((owner, location))
-
-    def add_leak(text, location: str) -> None:
-        if text:
-            leaks.append((str(text), location))
 
     for host in cfg.hosts:
         for svc in host.services:
@@ -93,23 +179,10 @@ def check_coherence(cfg: RangeConfig) -> CoherenceReport:
                     logins.append((user, pw, where))
                     add_secret(pw, user, f"{where} accept_creds[{user}]")
             elif svc.type == "http":
-                add_leak(svc.default_body, f"{where} default_body")
                 for path, hp in svc.paths.items():
-                    add_leak(hp.body, f"{where}{path} body")
                     for user, pw in hp.auth_users.items():
                         logins.append((user, pw, f"{where}{path}"))
                         add_secret(pw, user, f"{where}{path} auth_users[{user}]")
-            elif svc.type == "smb":
-                for share in svc.shares:
-                    add_leak(share.comment, f"{where}/{share.name} (comment)")
-                    for fname, content in share.files.items():
-                        add_leak(content, f"{where}/{share.name}/{fname}")
-            elif svc.type == "ldap":
-                for entry in svc.entries:
-                    for attr, values in entry.attributes.items():
-                        if attr.lower() in _LEAKY_ATTRS:
-                            for v in values:
-                                add_leak(v, f"{where} {entry.dn or 'RootDSE'}/{attr}")
             elif svc.type == "kerberos":
                 if svc.krbtgt_password != _KRBTGT_DEFAULT:
                     add_secret(svc.krbtgt_password, f"krbtgt@{host.id}", f"{where} krbtgt")
@@ -121,9 +194,6 @@ def check_coherence(cfg: RangeConfig) -> CoherenceReport:
                 if handle:
                     known.add(handle.lower())
             add_secret(u.password, u.sam, f"identities:{u.sam}.password")
-            add_leak(u.description, f"identities:{u.sam}.description")
-        for g in cfg.identities.groups:
-            add_leak(g.description, f"identities:group:{g.name}.description")
 
     _check_login_backing(cfg, logins, known, report)
     _check_reuse(secrets, report)
@@ -164,12 +234,9 @@ def _check_exploitable_leaks(secrets, leaks, report) -> None:
     a live credential is the classic transferable finding. Conservative match (whole token, min
     length) so a short/common password can't fabricate one."""
     for value, entries in secrets.items():
-        if len(value) < _MIN_LEAK_SECRET_LEN:
-            continue  # too short to assert a leak from a substring hit without fabricating
-        pattern = re.compile(r"(?<!\w)" + re.escape(value) + r"(?!\w)")
         cred_locs = {loc for _owner, loc in entries}
         for blob, leak_loc in leaks:
-            if leak_loc not in cred_locs and pattern.search(blob):
+            if leak_loc not in cred_locs and leak_contains(value, blob):
                 report.edges.append(Linkage(
                     kind="exploitable-leak", label=_secret_id(value),
                     locations=sorted([leak_loc, *cred_locs]), tier="possible-leak",
@@ -207,4 +274,5 @@ def format_report(report: CoherenceReport) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["CoherenceReport", "Linkage", "check_coherence", "format_report"]
+__all__ = ["CoherenceReport", "Linkage", "check_coherence", "format_report",
+           "iter_credentials", "iter_leaks", "leak_contains"]

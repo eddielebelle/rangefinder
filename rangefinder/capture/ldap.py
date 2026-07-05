@@ -219,6 +219,38 @@ def _bind(sock, mid: int, dn: str, password: str) -> int:
     return int(resp["protocolOp"]["bindResponse"]["resultCode"])
 
 
+def probe_credential(host: str, port: int, dn: str, password: str, *,
+                     tls: bool = False, timeout: float = 5.0) -> bool | None:
+    """Does the directory accept a simple bind as (dn, password)?
+
+    True if the bind succeeds, False if it is refused (invalid credentials / inappropriate auth),
+    None if the probe was inconclusive (unreachable / protocol error). Fail-closed: an inconclusive
+    probe never reports success, so `verify estate` can't score an unmeasured edge as real.
+    """
+    try:
+        sock = socket.create_connection((host, port), timeout)
+    except OSError:
+        return None
+    try:
+        if tls:
+            sock = _wrap_tls(sock)
+        rc = _bind(sock, 1, dn, password)
+        _unbind(sock, 2)
+        if rc == 0:
+            return True
+        if rc == 49:
+            return False   # invalidCredentials: the one code that unambiguously means "wrong password"
+        return None        # confidentialityRequired / unwilling / busy / operationsError: inconclusive,
+        #                    not a credential rejection — don't falsely disprove a possibly-valid edge
+    except (OSError, EOFError, PyAsn1Error, ValueError):
+        return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _probe_anonymous_bind(host: str, port: int, *, tls: bool = False,
                           timeout: float = 5.0) -> bool | None:
     """Does the target accept an anonymous simple bind? True / False, or None if inconclusive.
