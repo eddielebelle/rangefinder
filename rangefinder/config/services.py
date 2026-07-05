@@ -171,6 +171,10 @@ class LdapEntry(BaseModel):
 
     dn: str
     attributes: dict[str, list[str]] = Field(default_factory=dict)
+    # Binary-syntax attributes (objectSid, objectGUID, userCertificate, ntSecurityDescriptor…)
+    # whose values are not UTF-8 text. Values are base64-encoded here and served as raw octets, so
+    # SID/GUID/ACL identifiers a real directory returns survive the capture instead of being dropped.
+    binary_attributes: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class LdapConfig(ServiceBase):

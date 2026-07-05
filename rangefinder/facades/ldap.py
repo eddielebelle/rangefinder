@@ -22,6 +22,7 @@ control. It renders a directory for enumeration.
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
 from dataclasses import dataclass, field
 
@@ -44,14 +45,42 @@ _SCOPE_NAMES = {0: "base", 1: "one", 2: "sub"}
 class Entry:
     dn: str
     attrs: dict[str, list[str]]
+    # Binary-syntax attributes (objectSid/GUID/cert/ACL): raw bytes, emitted as raw octets on the
+    # wire. Kept separate from text attrs, which are UTF-8-encoded; not used for filter matching.
+    bin_attrs: dict[str, list[bytes]] = field(default_factory=dict)
     # lowercased attribute name -> values, for case-insensitive matching
     _lc: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self):
+        # Case-insensitive matching for filters. Binary attributes are keyed by name (base64 values)
+        # so a presence filter (objectSid=*) matches — a real DC both returns AND matches these, so
+        # returning objectSid while a presence filter missed it would be a self-contradicting tell.
         self._lc = {k.lower(): v for k, v in self.attrs.items()}
+        for k, vals in self.bin_attrs.items():
+            self._lc.setdefault(k.lower(), [base64.b64encode(b).decode("ascii") for b in vals])
 
     def get(self, name: str) -> list[str]:
         return self._lc.get(name.lower(), [])
+
+
+def _entry_from_config(e) -> "Entry":
+    """Build a served Entry from an LdapEntry, decoding base64 binary attributes back to raw bytes.
+
+    A corrupt base64 value (hand-edited config) is skipped rather than served as garbage octets or
+    crashing facade construction — validate=True rejects stray characters instead of silently
+    dropping them mid-string.
+    """
+    text = {k: list(v) for k, v in e.attributes.items()}
+    binary = {}
+    for k, vals in e.binary_attributes.items():
+        decoded = []
+        for x in vals:
+            try:
+                decoded.append(base64.b64decode(x, validate=True))
+            except Exception:
+                continue  # skip a corrupt value rather than serve a wrong SID/GUID
+        binary[k] = decoded
+    return Entry(e.dn, text, binary)
 
 
 def _base_dn(domain: str) -> str:
@@ -463,7 +492,7 @@ class LdapFacade(Facade):
             if e.dn == "":
                 root_override = e
             else:
-                entries.append(Entry(e.dn, {k: list(v) for k, v in e.attributes.items()}))
+                entries.append(_entry_from_config(e))
 
         # Dedup by DN (build_directory and build_computers can both emit CN=Computers, etc.),
         # keeping the first — the richer baseline container over the bare one.
@@ -476,7 +505,7 @@ class LdapFacade(Facade):
             seen.add(key)
             self.entries.append(e)
         if root_override is not None:
-            self.root_dse = Entry("", {k: list(v) for k, v in root_override.attributes.items()})
+            self.root_dse = _entry_from_config(root_override)
         else:
             self.root_dse = _root_dse(self.base_dn, ctx.host_name, domain)
 
@@ -715,7 +744,8 @@ class LdapFacade(Facade):
         # RootDSE: empty base + base scope is the client's first question. currentTime is an
         # operational attribute that must be live, so inject it fresh per query.
         if is_rootdse:
-            candidates = [Entry("", {**self.root_dse.attrs, "currentTime": [_ldap_now()]})]
+            candidates = [Entry("", {**self.root_dse.attrs, "currentTime": [_ldap_now()]},
+                                dict(self.root_dse.bin_attrs))]
         else:
             candidates = [
                 e
@@ -854,17 +884,34 @@ def _encode(message_id: int, op_name: str, op) -> bytes:
 def _entry_msg(entry: Entry, requested: list[str], types_only: bool):
     sre = L.SearchResultEntry()
     sre["objectName"] = entry.dn
-    attrs = _select_attrs(entry.attrs, requested)
+    text = _select_attrs(entry.attrs, requested)
+    binary = _select_attrs(entry.bin_attrs, requested)
     pal = sre["attributes"]
-    for i, (name, values) in enumerate(attrs.items()):
-        pa = pal.componentType.clone()
-        pa["type"] = name
-        if not types_only:
-            vals = pa["vals"]
-            for j, v in enumerate(values):
-                vals.setComponentByPosition(j, v)
-        pal.setComponentByPosition(i, pa)
+    seen_text = {n.lower() for n in text}
+    i = 0
+    # Emit every value as bytes so pyasn1 writes exact octets: text is explicitly UTF-8-encoded
+    # (pyasn1's default str->OctetString is latin-1, which would mojibake non-ASCII and crash on
+    # CJK), binary is already raw bytes — exactly what a real directory returns for SID/GUID/cert.
+    for name, values in text.items():
+        octets = [v.encode("utf-8") for v in values]
+        pal.setComponentByPosition(i, _partial_attr(pal, name, octets, types_only))
+        i += 1
+    for name, values in binary.items():
+        if name.lower() in seen_text:
+            continue  # never emit the same attribute type twice (a real DC returns each once)
+        pal.setComponentByPosition(i, _partial_attr(pal, name, values, types_only))
+        i += 1
     return sre
+
+
+def _partial_attr(pal, name: str, octets, types_only: bool):
+    pa = pal.componentType.clone()
+    pa["type"] = name
+    if not types_only:
+        vals = pa["vals"]
+        for j, v in enumerate(octets):
+            vals.setComponentByPosition(j, v)
+    return pa
 
 
 def _select_attrs(attrs: dict[str, list[str]], requested: list[str]) -> dict[str, list[str]]:
