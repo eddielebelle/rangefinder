@@ -10,7 +10,11 @@ It also validates NTLM binds: SASL GSS-SPNEGO (what GetUserSPNs / BloodHound use
 legacy MS Sicily mechanism both run the NTLM challenge/response against the ``identities``
 NT hashes. Simple binds are validated against known identity passwords (a wrong password
 for a known user returns invalidCredentials, like a real DC); a captured directory holds no
-passwords, so simple binds there stay permissive to keep replay working. Deliberate limits:
+passwords, so simple binds there stay permissive to keep replay working. When
+``allow_anonymous_bind`` is off the facade reproduces a hardened DC: the anonymous bind is
+refused (inappropriateAuthentication) and an unbound client's directory search is refused
+(operationsError), while the RootDSE stays anonymously readable — so a credentialed-captured
+twin never leaks its privileged view to an anonymous client. Deliberate limits:
 no NTLM signing/sealing on the post-bind session, no writes, no StartTLS, no paged-results
 control. It renders a directory for enumeration.
 """
@@ -499,6 +503,7 @@ class LdapFacade(Facade):
 
     async def handle(self, scope, reader, writer):
         ntlm_state: dict = {}  # per-connection NTLM (Sicily) bind state
+        session: dict = {"authenticated": False}  # flips on any successful bind
         while True:
             substrate = await _read_message(reader)
             if substrate is None:
@@ -507,7 +512,7 @@ class LdapFacade(Facade):
                 msg, _ = decoder.decode(substrate, asn1Spec=L.LDAPMessage())
             except PyAsn1Error:
                 # rfc2251 can't decode an MS Sicily (NTLM) bind; handle it out of band.
-                if await self._handle_sicily(scope, writer, substrate, ntlm_state):
+                if await self._handle_sicily(scope, writer, substrate, ntlm_state, session):
                     continue
                 return  # genuinely malformed
             mid = int(msg["messageID"])
@@ -518,11 +523,11 @@ class LdapFacade(Facade):
                 req = op["bindRequest"]
                 auth = req["authentication"]
                 if auth.getName() == "sasl" and str(auth["sasl"]["mechanism"]) == "GSS-SPNEGO":
-                    await self._handle_spnego(scope, writer, mid, bytes(auth["sasl"]["credentials"]), ntlm_state)
+                    await self._handle_spnego(scope, writer, mid, bytes(auth["sasl"]["credentials"]), ntlm_state, session)
                 else:
-                    await self._handle_bind(scope, writer, mid, req)
+                    await self._handle_bind(scope, writer, mid, req, session)
             elif kind == "searchRequest":
-                await self._handle_search(scope, writer, mid, op["searchRequest"])
+                await self._handle_search(scope, writer, mid, op["searchRequest"], session)
             elif kind == "unbindRequest":
                 return
             elif kind == "extendedReq":
@@ -535,7 +540,7 @@ class LdapFacade(Facade):
                 await writer.drain()
             # abandonRequest and unhandled ops: silently ignore (no response expected)
 
-    async def _handle_spnego(self, scope, writer, mid: int, creds: bytes, state: dict) -> None:
+    async def _handle_spnego(self, scope, writer, mid: int, creds: bytes, state: dict, session: dict) -> None:
         """NTLM over LDAP via SASL GSS-SPNEGO (what GetUserSPNs / BloodHound use)."""
         import struct
 
@@ -570,6 +575,7 @@ class LdapFacade(Facade):
             domain, user, _ws, _ = validate(token, None, challenge8, neg, chal)
             pw = self._passwords.get(user.lower())
             _, _, _, ok = validate(token, nt_hash(pw) if pw else None, challenge8, neg, chal)
+            session["authenticated"] = ok  # RFC 4513: a failed bind drops to unauthenticated
             writer.write(_bind_response(mid, 0 if ok else 49))
             await writer.drain()
             scope.emit(ev.ldap_bind(
@@ -580,7 +586,7 @@ class LdapFacade(Facade):
         writer.write(_bind_response(mid, 49))
         await writer.drain()
 
-    async def _handle_sicily(self, scope, writer, substrate: bytes, state: dict) -> bool:
+    async def _handle_sicily(self, scope, writer, substrate: bytes, state: dict, session: dict) -> bool:
         """Handle an MS-style NTLM (Sicily) LDAP bind. Returns True if it was one."""
         parsed = _parse_sicily_bind(substrate)
         if parsed is None:
@@ -613,6 +619,7 @@ class LdapFacade(Facade):
             domain, user, workstation, _ = validate(blob, None, challenge8, neg, chal)
             pw = self._passwords.get(user.lower())
             _, _, _, ok = validate(blob, nt_hash(pw) if pw else None, challenge8, neg, chal)
+            session["authenticated"] = ok  # RFC 4513: a failed bind drops to unauthenticated
             writer.write(_bind_response(mid, 0 if ok else 49))
             await writer.drain()
             scope.emit(ev.ldap_bind(
@@ -623,7 +630,7 @@ class LdapFacade(Facade):
             return True
         return False
 
-    async def _handle_bind(self, scope: ConnScope, writer, mid: int, req) -> None:
+    async def _handle_bind(self, scope: ConnScope, writer, mid: int, req, session: dict) -> None:
         bind_dn = str(req["name"])
         auth = req["authentication"]
         method = auth.getName()
@@ -636,18 +643,29 @@ class LdapFacade(Facade):
             result = "success" if self.cfg.allow_anonymous_bind else "inappropriateAuthentication"
         elif method == "simple":
             # Validate against a known credential when we have one (identities-rendered users):
-            # a real DC returns invalidCredentials for a wrong password, and answering
-            # "success" to any password is both wrong and an obvious decoy tell. For captured
-            # directories we hold no passwords, so stay permissive there (else replay breaks).
+            # a real DC returns invalidCredentials for a wrong password, and answering "success"
+            # to any password is both wrong and an obvious decoy tell.
             known = self._passwords.get(_bind_user(bind_dn))
-            if known is None:
-                result = "success"
-            elif password == known:
+            if known is not None:
+                result = "success" if password == known else "invalidCredentials"
+            elif self.cfg.allow_anonymous_bind:
+                # Open directory: we can't validate (no stored password) but anonymous can read
+                # anyway, so a permissive success keeps captured-directory replay working without
+                # widening exposure.
                 result = "success"
             else:
+                # Hardened directory + a credential we cannot validate: FAIL CLOSED. Answering
+                # "success" here would let `ldapsearch -D cn=anything -w whatever` unlock the
+                # gated directory — fabricating a credential-access finding a real DC (which
+                # returns invalidCredentials for an unverifiable principal) would never allow.
                 result = "invalidCredentials"
         else:
             result = "success"
+
+        # RFC 4513: a bind attempt resets the connection's auth state — success authenticates,
+        # any failure drops it back to unauthenticated (so a failed re-bind can't keep a gated
+        # directory unlocked).
+        session["authenticated"] = result == "success"
 
         br = L.BindResponse()
         br["resultCode"] = result
@@ -666,7 +684,7 @@ class LdapFacade(Facade):
             )
         )
 
-    async def _handle_search(self, scope: ConnScope, writer, mid: int, req) -> None:
+    async def _handle_search(self, scope: ConnScope, writer, mid: int, req, session: dict) -> None:
         base = str(req["baseObject"])
         scope_i = int(req["scope"])
         size_limit = int(req["sizeLimit"])
@@ -674,9 +692,29 @@ class LdapFacade(Facade):
         requested = [str(a) for a in req["attributes"]]
         filt = req["filter"]
 
+        is_rootdse = base == "" and scope_i == 0
+        # Anonymous operations disabled + no successful bind: a real DC refuses the search with
+        # operationsError ("a successful bind must be completed"). The RootDSE stays exempt
+        # (RFC 4513 permits an anonymous RootDSE read even when anon bind is disabled). This is
+        # what keeps a credentialed-captured twin from serving its privileged view to an unbound
+        # client — the fail-open the capture is careful never to configure.
+        if not self.cfg.allow_anonymous_bind and not session["authenticated"] and not is_rootdse:
+            done = L.SearchResultDone()
+            done["resultCode"] = "operationsError"
+            done["matchedDN"] = ""
+            done["errorMessage"] = ("000004DC: LdapErr: DSID-0C090A5C, comment: In order to "
+                                    "perform this operation a successful bind must be completed")
+            writer.write(_encode(mid, "searchResDone", done))
+            await writer.drain()
+            scope.emit(ev.ldap_search(
+                scope, base=base or "(RootDSE)",
+                search_scope=_SCOPE_NAMES.get(scope_i, str(scope_i)),
+                filter_str=filter_to_str(filt), entries=0))
+            return
+
         # RootDSE: empty base + base scope is the client's first question. currentTime is an
         # operational attribute that must be live, so inject it fresh per query.
-        if base == "" and scope_i == 0:
+        if is_rootdse:
             candidates = [Entry("", {**self.root_dse.attrs, "currentTime": [_ldap_now()]})]
         else:
             candidates = [

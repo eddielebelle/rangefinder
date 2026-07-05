@@ -43,13 +43,14 @@ async def _spnego_login(facade, password):
 
     scope = ConnScope(facade, "10.0.0.9", 5000)
     state = {}
+    session = {"authenticated": False}
 
     type1 = getNTLMSSPType1("", "ACME")
     init = SPNEGO_NegTokenInit()
     init["MechTypes"] = [TypesMech["NTLMSSP - Microsoft NTLM Security Support Provider"]]
     init["MechToken"] = type1.getData()
     w1 = _FakeWriter()
-    await facade._handle_spnego(scope, w1, 1, init.getData(), state)
+    await facade._handle_spnego(scope, w1, 1, init.getData(), state, session)
     rc1, creds = _bind_result(w1.buf)
     assert rc1 == 14  # saslBindInProgress
     type2 = SPNEGO_NegTokenResp(creds)["ResponseToken"]
@@ -58,7 +59,7 @@ async def _spnego_login(facade, password):
     resp = SPNEGO_NegTokenResp()
     resp["ResponseToken"] = type3.getData()
     w2 = _FakeWriter()
-    await facade._handle_spnego(scope, w2, 2, resp.getData(), state)
+    await facade._handle_spnego(scope, w2, 2, resp.getData(), state, session)
     rc2, _ = _bind_result(w2.buf)
     return rc2
 
@@ -95,7 +96,7 @@ def test_simple_bind_validates_known_users():
         br["name"] = dn
         br["authentication"]["simple"] = pw.encode()
         w = _FakeWriter()
-        asyncio.run(facade._handle_bind(scope, w, 7, br))
+        asyncio.run(facade._handle_bind(scope, w, 7, br, {"authenticated": False}))
         return _bind_result(w.buf)[0]
 
     assert simple_bind("svc-web@acme.corp", "Autumn2025!") == 0    # correct -> success

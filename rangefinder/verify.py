@@ -282,7 +282,7 @@ def _diff_http(path, real, repl, compare_headers) -> list[Divergence]:
 
 def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str = "",
                 password: str = "", timeout: float = 5.0) -> VerifyReport:
-    from rangefinder.capture.ldap import capture_ldap
+    from rangefinder.capture.ldap import _probe_anonymous_bind, capture_ldap
 
     service, warnings, _ = capture_ldap(host, port, tls=tls, bind_dn=bind_dn,
                                      password=password, timeout=timeout, scrub=False)
@@ -293,8 +293,12 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
         # Enumerate the replica through the facade's own rendering, same access level.
         repl_service, _, _ = capture_ldap("127.0.0.1", srv.port, tls=False, bind_dn=bind_dn,
                                           password=password, timeout=timeout, scrub=False)
+        # Probe anonymous-bind acceptance directly on the twin (behavioural, not the fail-closed
+        # config value), so a facade regression that served anon would surface as a divergence.
+        repl_anon = _probe_anonymous_bind("127.0.0.1", srv.port, timeout=timeout)
         time.sleep(0.1)
         det_events = srv.events
+    real_anon = _probe_anonymous_bind(host, port, tls=tls, timeout=timeout)
     repl = {e["dn"]: e["attributes"] for e in repl_service["entries"]}
     _detection(report, det_events)
 
@@ -311,6 +315,19 @@ def verify_ldap(host: str, port: int = 389, *, tls: bool = False, bind_dn: str =
     for dn in repl:
         if dn not in real:
             report.divergences.append(Divergence(dn or "(RootDSE)", "extra", "entry only on replica"))
+
+    # Posture diff: the twin must reproduce the anon-bind posture, not just the entries. We compare
+    # the *behaviour* observed on each side (a live anonymous bind), so anon enforcement can't
+    # silently regress into a false "anonymous bind allowed" finding. (Inconclusive probes on either
+    # side -> skip; there's nothing to assert.)
+    if real_anon is not None and repl_anon is not None:
+        report.total += 1
+        if real_anon == repl_anon:
+            report.matched += 1
+        else:
+            report.divergences.append(Divergence(
+                "posture:allow_anonymous_bind", "posture",
+                f"real anon-bind accepted={real_anon} vs replica {repl_anon}"))
 
     report.boundary.append(
         "fidelity claimed only for the "
@@ -388,6 +405,15 @@ def verify_smb(host: str, port: int = 445, *, username: str = "", password: str 
     # and dialect stay locked and can't silently regress into a false finding.
     for f in ("server_os", "signing_required", "smb1_enabled", "reject_unknown_users", "max_dialect"):
         if f not in service:
+            continue
+        # Known facade limitation: the impacket backend can't do AES-CMAC signing, so at SMB 3.1.1
+        # it advertises signing enabled-but-not-required regardless of cfg.signing_required. That's
+        # a documented boundary, not a per-host fidelity gap — diffing it would flag every faithful
+        # modern (3.1.1, signing-required) twin, so record it as a boundary and skip the diff.
+        if f == "signing_required" and service.get("max_dialect") == "3.1.1":
+            report.boundary.append(
+                "SMB 3.1.1 signing_required not reproduced: the impacket backend can't AES-CMAC "
+                "sign, so the twin advertises signing enabled-not-required at 3.1.1 (known limit)")
             continue
         report.total += 1
         rv, pv = service.get(f), repl_service.get(f)
