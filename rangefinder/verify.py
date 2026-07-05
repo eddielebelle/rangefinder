@@ -698,3 +698,110 @@ def _diff_files(real: dict, repl: dict) -> str:
     if problems:
         return "files " + ", ".join(sorted(problems))
     return ""
+
+
+# --------------------------------------------------------------- estate-level edge verification
+
+@dataclass
+class EdgeResult:
+    kind: str
+    host_id: str
+    username: str
+    origin: str
+    target: str                    # live addr:port tested, or "-"
+    verdict: str                   # measured-live | refuted | untested
+    leaked_at: list[str] = field(default_factory=list)
+    note: str = ""
+
+    @property
+    def exploitable(self) -> bool:
+        """A credential that authenticates live AND sits in leaked text — the transferable finding."""
+        return self.verdict == "measured-live" and bool(self.leaked_at)
+
+
+@dataclass
+class EstateReport:
+    target: str
+    results: list[EdgeResult] = field(default_factory=list)
+    boundary: list[str] = field(default_factory=list)
+
+    @property
+    def confirmed(self) -> list[EdgeResult]:
+        return [r for r in self.results if r.verdict == "measured-live"]
+
+    @property
+    def exploitable(self) -> list[EdgeResult]:
+        return [r for r in self.results if r.exploitable]
+
+    @property
+    def refuted(self) -> list[EdgeResult]:
+        return [r for r in self.results if r.verdict == "refuted"]
+
+    @property
+    def untested(self) -> list[EdgeResult]:
+        return [r for r in self.results if r.verdict == "untested"]
+
+    @property
+    def ok(self) -> bool:
+        """No credential was confirmed to both authenticate live and sit in a readable leak."""
+        return not self.exploitable
+
+
+def verify_estate(cfg: RangeConfig, targets: dict, *, timeout: float = 5.0) -> EstateReport:
+    """Validate a range's coherence edges against the live estate, tiering each credential claim
+    measured-live / refuted / untested (fail-closed on anything not proven).
+
+    ``targets`` maps a config host id -> (live_address, port_or_None); a credential whose host has
+    no target, or whose live probe is inconclusive, is recorded untested (never scored as real).
+    """
+    from rangefinder.coherence import iter_credentials, iter_leaks, leak_contains
+    from rangefinder.credtest import validate_credential
+
+    leaks = list(iter_leaks(cfg))
+    shown = ", ".join(f"{hid}={addr}" for hid, (addr, _p) in sorted(targets.items())) or "(none)"
+    report = EstateReport(target=shown)
+
+    claims = list(iter_credentials(cfg))
+    # A --target port override is only unambiguous when the host exposes one service port; on a
+    # multi-service host (LDAP 389 + SMB 445) a single port would misroute the others, so fall back
+    # to each claim's own port and say so once.
+    host_ports: dict = {}
+    for c in claims:
+        host_ports.setdefault(c["host_id"], set()).add(c["port"])
+    warned_ambiguous: set = set()
+
+    for claim in claims:
+        hid = claim["host_id"]
+        leaked_at = sorted({loc for text, loc in leaks if leak_contains(claim["secret"], text)})
+        if hid not in targets:
+            report.results.append(EdgeResult(
+                claim["kind"], hid, claim["username"], claim["origin"], "-", "untested",
+                leaked_at, "no --target for this host"))
+            continue
+        addr, tport = targets[hid]
+        if tport is not None and len(host_ports[hid]) == 1:
+            port = tport
+        else:
+            port = claim["port"]
+            if tport is not None and hid not in warned_ambiguous:
+                warned_ambiguous.add(hid)
+                report.boundary.append(
+                    f"--target port for {hid!r} ignored: host has multiple service ports "
+                    f"({sorted(host_ports[hid])}); used each service's own port")
+        verdict = validate_credential(
+            claim["kind"], addr, port, claim["username"], claim["secret"],
+            domain=claim.get("domain", ""), path=claim.get("path", "/"),
+            tls=claim.get("tls", False), timeout=timeout)
+        tier = {True: "measured-live", False: "refuted", None: "untested"}[verdict]
+        note = ("authenticates on the live estate" if verdict is True
+                else "rejected by the live service" if verdict is False
+                else "probe inconclusive (unreachable / unsupported)")
+        report.results.append(EdgeResult(
+            claim["kind"], hid, claim["username"], claim["origin"], f"{addr}:{port}", tier,
+            leaked_at, note))
+
+    if report.untested:
+        report.boundary.append(
+            f"{len(report.untested)} credential(s) not validated live (no target / unreachable) — "
+            f"their edges stay unproven, not disproven")
+    return report

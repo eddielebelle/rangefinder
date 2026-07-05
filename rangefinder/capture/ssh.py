@@ -212,3 +212,28 @@ def _probe_auth_methods(host: str, port: int, timeout: float) -> list[str] | Non
         return list(asyncio.run(_go()))
     except Exception:
         return None
+
+
+def probe_credential(host: str, port: int, username: str, password: str, *,
+                     timeout: float = 5.0) -> "bool | None":
+    """Does the SSH host accept a password logon as (username, password)?
+
+    True if authentication succeeds, False if the server denies it (asyncssh.PermissionDenied),
+    None if inconclusive (unreachable / handshake error / timeout). Fail-closed: inconclusive
+    never reports success.
+    """
+    import asyncio
+
+    import asyncssh
+
+    async def _go():
+        async with asyncssh.connect(host, port=port, username=username, password=password,
+                                    known_hosts=None, login_timeout=timeout):
+            return True
+
+    try:
+        return asyncio.run(asyncio.wait_for(_go(), timeout + 2))
+    except asyncssh.PermissionDenied:
+        return False
+    except Exception:
+        return None

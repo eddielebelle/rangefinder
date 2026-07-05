@@ -305,3 +305,38 @@ def _content(data: bytes, scrubber: Scrubber | None) -> str:
 def _cstr(value: str) -> str:
     # impacket returns null-terminated strings for share fields.
     return value[:-1] if value.endswith("\x00") else value
+
+
+def probe_credential(host: str, port: int, username: str, password: str, *,
+                     domain: str = "", timeout: float = 5.0) -> "bool | None":
+    """Does the SMB host accept a logon as (domain\\username, password)?
+
+    True on a successful session, False if the server rejects the credential (SessionError),
+    None if inconclusive (unreachable / backend error). Fail-closed: inconclusive never reports
+    success, so `verify estate` can't score an unmeasured credential edge as real.
+    """
+    from impacket.smbconnection import SMBConnection, SessionError
+
+    try:
+        conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
+    except Exception:
+        return None
+    try:
+        conn.login(username, password, domain)
+        # A guest-mapping host accepts *any* credential and drops it into a guest session, so a
+        # login that didn't raise doesn't prove the password is right. Treat a guest session as a
+        # rejection (fail closed) — never score a guest-mapped bad password as authenticated.
+        try:
+            if conn.isGuestSession():
+                return False
+        except Exception:
+            pass
+        try:
+            conn.logoff()
+        except Exception:
+            pass
+        return True
+    except SessionError:
+        return False
+    except Exception:
+        return None

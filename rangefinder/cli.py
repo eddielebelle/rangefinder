@@ -164,6 +164,14 @@ def main(argv: list[str] | None = None) -> int:
     p_v_ssh.add_argument("--port", type=int, default=22)
     p_v_ssh.add_argument("--json", action="store_true", help="emit the report as JSON")
 
+    p_v_estate = verify_sub.add_parser(
+        "estate", help="validate a range's credential edges against the live estate")
+    p_v_estate.add_argument("config", type=Path)
+    p_v_estate.add_argument("--target", action="append", default=[], metavar="ID=ADDR[:PORT]",
+                            help="live address for a config host id (repeatable)")
+    p_v_estate.add_argument("--timeout", type=float, default=5.0)
+    p_v_estate.add_argument("--json", action="store_true", help="emit the report as JSON")
+
     p_merge = sub.add_parser(
         "merge", help="merge captured single-service configs into one estate twin")
     p_merge.add_argument("configs", nargs="+", type=Path,
@@ -727,8 +735,84 @@ def cmd_detect(args) -> int:
     return EXIT_OK if validated else EXIT_ERROR
 
 
+def _parse_targets(specs) -> dict:
+    """Parse repeated ``ID=ADDR[:PORT]`` into {host_id: (addr, port_or_None)}.
+
+    IPv6-safe: a bracketed ``[2001:db8::5]:636`` splits host/port; a bare ``fe80::1`` (multiple
+    colons, no brackets) is treated as an address with no port so it isn't mangled.
+    """
+    targets: dict = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"bad --target {spec!r}; expected ID=ADDR[:PORT]")
+        hid, addr = spec.split("=", 1)
+        port = None
+        if addr.startswith("["):                       # [IPv6] or [IPv6]:PORT
+            host, _, rest = addr[1:].partition("]")
+            addr = host
+            if rest.startswith(":") and rest[1:].isdigit():
+                port = int(rest[1:])
+        elif addr.count(":") == 1:                      # host:PORT (IPv4 / hostname)
+            host, _, tail = addr.partition(":")
+            if tail.isdigit():
+                addr, port = host, int(tail)
+        # else: bare IPv6 (>1 colon) or a plain host -> address only, no port
+        targets[hid] = (addr, port)
+    return targets
+
+
+def cmd_verify_estate(args) -> int:
+    import dataclasses
+
+    from rangefinder.verify import verify_estate
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        targets = _parse_targets(args.target)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if not targets:
+        print("error: verify estate needs at least one --target ID=ADDR[:PORT]", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        report = verify_estate(cfg, targets, timeout=args.timeout)
+    except Exception as exc:  # network I/O against arbitrary targets: never dump a traceback
+        print(f"error: verify estate failed ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.json:
+        print(json.dumps(dataclasses.asdict(report) | {"ok": report.ok}, indent=2))
+        return EXIT_OK if report.ok else EXIT_ERROR
+
+    print(f"Estate credential verification  (targets: {report.target})")
+    print(f"  {len(report.confirmed)} confirmed live, {len(report.refuted)} refuted, "
+          f"{len(report.untested)} untested  of {len(report.results)} credential edge(s)")
+    marks = {"measured-live": "✓ live", "refuted": "✗ refuted", "untested": "· untested"}
+    for r in report.results:
+        leak = f"  [leaked at {', '.join(r.leaked_at)}]" if r.leaked_at else ""
+        crit = "  ‼ EXPLOITABLE" if r.exploitable else ""
+        print(f"    {marks[r.verdict]:11} {r.kind}:{r.username}@{r.target}  ({r.origin}){leak}{crit}")
+    if report.exploitable:
+        print(f"\n  ‼ {len(report.exploitable)} credential(s) authenticate live AND sit in readable "
+              f"leaks — remediate")
+    for b in report.boundary:
+        print(f"  boundary: {b}")
+    verdict = "NO CONFIRMED EXPLOITABLE PATH" if report.ok else "EXPLOITABLE CREDENTIAL PATH(S) FOUND"
+    print(f"\n  => {verdict}")
+    return EXIT_OK if report.ok else EXIT_ERROR
+
+
 def cmd_verify(args) -> int:
     import dataclasses
+
+    if args.proto == "estate":
+        return cmd_verify_estate(args)
 
     from rangefinder.verify import verify_dns, verify_http, verify_ldap, verify_smb, verify_ssh
 
