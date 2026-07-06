@@ -424,7 +424,13 @@ def cmd_capture(args) -> int:
         print(f"error: captured config is invalid: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    _emit_config(json.dumps(config, indent=2) + "\n", out_path)
+    config_json = json.dumps(config, indent=2) + "\n"
+    _emit_config(config_json, out_path)
+    # Review-then-save: with no -o at an interactive terminal, the twin is shown on stdout (above);
+    # then offer to save it, so the operator sees exactly what was captured — secrets and all —
+    # before it is written anywhere. Skipped when piped/redirected/headless so scripts never block.
+    if out_path is None and sys.stdout.isatty() and sys.stdin.isatty():
+        out_path = _prompt_save(config_json)
     for w in warnings:
         print(f"note: {w}", file=sys.stderr)
 
@@ -518,6 +524,28 @@ def _emit_config(text: str, out) -> None:
         print(f"wrote {out}", file=sys.stderr)
     else:
         sys.stdout.write(text)
+
+
+def _prompt_save(text: str):
+    """After showing a captured twin on stdout, ask whether to save it (interactive terminals only).
+
+    Returns the Path written, or None if the operator declined. The prompt is written to stderr so
+    stdout stays a clean JSON stream; input is read from the terminal.
+    """
+    print("\nSave this twin to a file? Enter a path (blank = don't save): ",
+          end="", file=sys.stderr, flush=True)
+    try:
+        answer = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return None
+    if not answer:
+        print("not saved (shown above).", file=sys.stderr)
+        return None
+    path = Path(answer).expanduser()
+    path.write_text(text, encoding="utf-8")
+    print(f"wrote {path}", file=sys.stderr)
+    return path
 
 
 def _print_capture_report(report) -> None:
