@@ -12,6 +12,14 @@ so the twin reproduces the denial — otherwise it would serve an empty share wi
 agent would report a write/read exposure that does not exist on the real server. The server's
 signing posture (``signing_required``) is captured for the same reason.
 
+Credentialed capture reads deeper — the *authenticated* file view — so it carries the mirror-image
+risk: those files must never be served to a null session, or the twin fabricates an anonymous
+exposure the real host does not have. So a credentialed capture measures each share's anonymous
+readability with a separate null session and marks ``restrict_anonymous`` on every share a null
+session could not read (fail-closed on the unmeasured). The twin then gates the authenticated view
+behind auth, exactly as the real server does. (Granularity is share-level, matching the config
+model; per-file ACLs within an anon-readable share are a future enhancement.)
+
 Uses impacket's SMB client (already a dependency). Text files are captured verbatim; binary
 and oversized files are recorded by name with a placeholder so the tree stays faithful
 without bloating the config. ``scrub=True`` redacts secrets in captured text.
@@ -71,6 +79,7 @@ def capture_smb(
     anonymous = not username  # null session: denials become restrict_anonymous, not empty shares
     perspective = "anonymous / null session" if anonymous else f"authenticated as {username!r}"
     report = CaptureReport(target=host, perspective=perspective, protocol="smb")
+    anon_probe = None  # a null session opened (for credentialed captures) to measure anon access
     conn = SMBConnection(host, host, sess_port=port, timeout=timeout)
     try:
         conn.login(username, password, domain)
@@ -115,6 +124,11 @@ def capture_smb(
                 "reject_unknown_users", "measured", str(reject).lower(),
                 "bogus login " + ("rejected" if reject else "accepted as guest")))
 
+        # Credentialed capture reads the authenticated view; measure per-share whether a null
+        # session can read each share so the twin gates auth-only shares behind auth (fail-closed).
+        anon_probe = None if anonymous else _AnonProbe(host, port, timeout, domain)
+        anon_results: dict[str, bool | None] = {}
+
         shares_cfg: list[dict] = []
         overall = _Budget(max_files)
         seen: set[str] = set()
@@ -145,11 +159,21 @@ def capture_smb(
                 warnings.append(f"share {name!r}: not fully readable at this access level ({exc})")
 
             entry: dict = {"name": name, "comment": comment, "readonly": True}
-            # A null session that was refused read access is a faithful "enumerable but not
-            # readable" share: mark it so the twin reproduces the denial rather than serving an
-            # empty share wide open. (With credentials, a denial can't be modelled as anonymous.)
-            if denied and anonymous and not files:
-                entry["restrict_anonymous"] = True
+            if anonymous:
+                # A null session refused read access is a faithful "enumerable but not readable"
+                # share: mark it so the twin reproduces the denial rather than serving an empty
+                # share wide open.
+                if denied and not files:
+                    entry["restrict_anonymous"] = True
+            else:
+                # Credentialed capture: the files we read are the authenticated view. Gate the
+                # share behind auth in the twin unless a null session can actually read it —
+                # serving the privileged view to anon would fabricate an exposure the real host
+                # does not have. Denied or inconclusive -> gate (fail closed).
+                anon_ok = anon_probe.can_read(name)
+                anon_results[name] = anon_ok
+                if anon_ok is not True:
+                    entry["restrict_anonymous"] = True
             if files:
                 entry["files"] = files
             shares_cfg.append(entry)
@@ -163,6 +187,8 @@ def capture_smb(
             for missing in sorted(want - seen):
                 warnings.append(f"requested share {missing!r} not found on {host}")
     finally:
+        if anon_probe is not None:
+            anon_probe.close()
         try:
             conn.close()
         except Exception:
@@ -174,13 +200,20 @@ def capture_smb(
                      "shares": shares_cfg}
     total = sum(len(s.get("files", {})) for s in shares_cfg)
 
-    # Share access is a measured fact: names enumerated, how many refused this session, how many
-    # yielded files. The report states it so "empty share" vs "denied share" is never ambiguous.
+    # Share access is a measured fact: names enumerated and how many yielded files. The
+    # "denied" phrasing is perspective-specific — for an anonymous capture the capture session IS
+    # the null session, so restrict_anonymous means "this session was denied read"; for a
+    # credentialed capture restrict_anonymous instead means "gated to auth" (measured by the
+    # separate null probe below), and the capture session may well have read the share — so the
+    # note must not claim the authenticated session was denied a share it read.
     n_restricted = sum(1 for s in shares_cfg if s.get("restrict_anonymous"))
     n_withfiles = sum(1 for s in shares_cfg if s.get("files"))
+    if anonymous:
+        shares_detail = f"{n_restricted} deny this session, {n_withfiles} readable ({total} file(s))"
+    else:
+        shares_detail = f"{n_withfiles} readable to this session ({total} file(s))"
     report.items.append(PostureItem(
-        "shares", "measured", f"{len(shares_cfg)} enumerable",
-        f"{n_restricted} deny this session, {n_withfiles} readable ({total} file(s))"))
+        "shares", "measured", f"{len(shares_cfg)} enumerable", shares_detail))
 
     # The authenticated surface is unknowable from an anonymous capture — no default is right.
     if anonymous:
@@ -188,6 +221,24 @@ def capture_smb(
             "authenticated_read_write", "unmeasurable", "unknown",
             "captured anonymously; what a valid user can read/write was not measured. "
             "Re-capture with -u/-p to measure, or the twin presents these shares as deny-all."))
+    else:
+        # Credentialed capture read the authenticated view; a separate null session measured which
+        # shares a null session can reach, so the twin gates the rest behind auth. Report the
+        # *measured* outcomes (denied / readable) separately from shares only gated by a fail-closed
+        # assumption (an inconclusive probe) — never present an unrun probe as a measured denial.
+        n_measured_denied = sum(1 for r in anon_results.values() if r is False)
+        n_open = sum(1 for r in anon_results.values() if r is True)
+        report.items.append(PostureItem(
+            "anonymous_share_access", "measured",
+            f"{n_measured_denied} gated, {n_open} anon-readable (of {len(shares_cfg)} shares)",
+            "per-share null-session probe: shares a null session could not read are gated behind "
+            "auth in the twin (the authenticated file view is never served to anon)"))
+        inconclusive = sorted(n for n, r in anon_results.items() if r is None)
+        if inconclusive:
+            report.items.append(PostureItem(
+                "anonymous_share_access", "assumed", f"{len(inconclusive)} inconclusive",
+                f"null-session probe inconclusive for {', '.join(inconclusive)}; "
+                "gated behind auth (fail-closed)"))
 
     warnings.append(f"captured {len(shares_cfg)} share(s), {total} file(s) from {host}")
     return service, warnings, report
@@ -229,6 +280,61 @@ def _probe_reject_unknown(host: str, port: int, timeout: float, domain: str) -> 
         return True if exc.getErrorCode() == STATUS_LOGON_FAILURE else None
     except Exception:
         return None
+
+
+def _safe_close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+class _AnonProbe:
+    """A reusable null session for measuring per-share anonymous read access during a credentialed
+    capture.
+
+    ``can_read(share)`` returns True if a null session can list the share, False if it is refused,
+    None if inconclusive. A cleanly *refused* null login is a measured fact (the server serves no
+    null sessions, so anon can reach nothing) and reads every share as denied; a login that failed
+    for any other reason (unreachable probe, transport error) is inconclusive, so every share reads
+    as None — the report must not present a probe that never ran as a measured denial.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float, domain: str):
+        from impacket.smbconnection import SMBConnection, SessionError
+
+        self._conn = None
+        self._null_refused = False  # True only when the null login was *cleanly* refused (measured)
+        try:
+            c = SMBConnection(host, host, sess_port=port, timeout=timeout)
+        except Exception:
+            return  # couldn't even reach the service to probe -> inconclusive (can_read -> None)
+        try:
+            c.login("", "", domain)
+            self._conn = c
+        except SessionError:
+            self._null_refused = True  # server refuses null sessions -> anon reaches nothing
+            _safe_close(c)
+        except Exception:
+            _safe_close(c)  # non-refusal login error -> inconclusive, _null_refused stays False
+
+    def can_read(self, share_name: str) -> bool | None:
+        if self._conn is None:
+            return False if self._null_refused else None  # measured-denied vs inconclusive
+        from impacket.nt_errors import STATUS_ACCESS_DENIED
+        from impacket.smbconnection import SessionError
+
+        try:
+            self._conn.listPath(share_name, "*")
+            return True
+        except SessionError as exc:
+            return False if exc.getErrorCode() == STATUS_ACCESS_DENIED else None
+        except Exception:
+            return None
+
+    def close(self) -> None:
+        if self._conn is not None:
+            _safe_close(self._conn)
 
 
 class _Budget:
