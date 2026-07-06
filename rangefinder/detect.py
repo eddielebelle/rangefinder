@@ -10,7 +10,11 @@ This module is the deterministic core:
 - a minimal Sigma evaluator (selection maps + a condition expression) over ECS events,
 - ``validate()`` which grades a rule against labelled attack/benign logs,
 - a small template generator so ``rangefinder detect`` produces a validated baseline with no
-  agent in the loop.
+  agent in the loop,
+- ``from_objectives()`` which compiles the range's own objectives — themselves declarative ECS
+  detection specs — straight into Sigma, so the range-specific finding becomes a deployable rule
+  and not just a scoreboard entry. Every compiled rule runs the same ``validate()`` gauntlet, so
+  one that keys on a field the range never emits is caught as a MISS, never shipped dead.
 
 A blue-team agent can write richer rules; this harness is what makes its output trustworthy
 rather than plausible — every rule is run back over the ground-truth telemetry.
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import uuid
 from dataclasses import dataclass, field
 
 from rangefinder.scoring import _get, parse_events  # dotted-path getter + log parser
@@ -60,6 +65,12 @@ def _match_field(event: dict, key: str, spec) -> bool:
                     return True
             elif "endswith" in mods:
                 if s.lower().endswith(ws.lower()):
+                    return True
+            elif "cased" in mods:
+                # Sigma 'cased' modifier: exact, case-SENSITIVE match. Compiled objective rules use
+                # it for `equals` so they fire on exactly the event set the objective scores as MET
+                # (scoring._condition_matches compares equals with a case-sensitive `==`).
+                if s == ws:
                     return True
             elif s.lower() == ws.lower():
                 return True
@@ -270,7 +281,98 @@ def generate(attack_events: list[dict]) -> list[dict]:
     return rules
 
 
+# ------------------------------------------------------- objective -> Sigma compiler
+
+# A range author declares each Objective as a set of ECS field predicates — exactly a detection
+# spec. Compile those straight into Sigma so the *range-specific* finding (the planted leak, the
+# roastable account) becomes a deployable rule, not just a scoreboard entry. Every compiled rule
+# still runs the gauntlet of validate() against ground-truth telemetry before it is trusted, so a
+# rule that keys on a field the range never emits is caught as a MISS rather than shipped dead.
+#
+# uuid5 (a stable hash, no randomness) gives each rule a deterministic id: the same objective in
+# the same range always compiles to the same rule id, so redeploys don't churn SIEM content.
+_RULE_NS = uuid.uuid5(uuid.NAMESPACE_DNS, "rangefinder.detections")
+
+
+def _condition_selection(cond) -> tuple[str, object]:
+    """Compile one Objective Condition into a Sigma ``field[|modifier]`` key and its value.
+
+    The modifier is chosen so the Sigma rule matches *exactly* the events the objective scores as
+    MET (scoring._condition_matches): ``equals`` is case-sensitive there, so it compiles to the
+    Sigma ``|cased`` modifier — a plain (case-insensitive) selection would over-fire on case
+    variants the objective never marks met.
+    """
+    if cond.equals is not None:
+        return f"{cond.field}|cased", cond.equals
+    if cond.contains is not None:
+        return f"{cond.field}|contains", cond.contains
+    if cond.regex is not None:
+        return f"{cond.field}|re", cond.regex
+    # The config model guarantees exactly one matcher is set; fail loud rather than emit a
+    # selection that silently matches nothing.
+    raise ValueError(f"condition on {cond.field!r} has no matcher")
+
+
+def compile_objective(obj, range_name: str) -> dict | None:
+    """Compile one Objective's single-event ``detect`` signals into a Sigma rule dict.
+
+    Signals are OR-ed (any signal met satisfies the objective); the conditions within a signal are
+    AND-ed. Each condition becomes its own selection so two conditions on the *same* field stay an
+    AND (a single selection map would collapse them into an OR value list — the wrong semantics).
+
+    Returns None when there is nothing single-event to compile: a descriptive-only objective, or a
+    sequence-only one. Ordered kill chains (``sequence``) map to Sigma *correlation* rules, which
+    the single-event validator here cannot yet grade — so rather than emit an unvalidated rule that
+    merely looks deployable, the caller surfaces them as not-yet-compiled.
+    """
+    if not obj.detect:
+        return None
+    detection: dict = {}
+    signal_groups: list[str] = []
+    for si, signal in enumerate(obj.detect):
+        names = []
+        for ci, cond in enumerate(signal.all):
+            name = f"sig{si}cond{ci}"
+            field_key, value = _condition_selection(cond)
+            detection[name] = {field_key: value}
+            names.append(name)
+        signal_groups.append("(" + " and ".join(names) + ")")
+    detection["condition"] = " or ".join(signal_groups)
+    return {
+        "title": obj.title,
+        "id": str(uuid.uuid5(_RULE_NS, f"{range_name}:{obj.id}")),
+        "status": "experimental",
+        "description": obj.description,
+        "logsource": {"product": "rangefinder"},
+        "detection": detection,
+        "level": "medium",
+        # Provenance: trace a deployed rule back to the objective it came from. Sigma tolerates
+        # custom top-level fields; this one lets `score` and a reviewer tie rule <-> objective.
+        "rangefinder_objective": obj.id,
+    }
+
+
+def from_objectives(config) -> list[dict]:
+    """Compile every objective with single-event ``detect`` signals into a Sigma rule."""
+    rules = []
+    for obj in config.objectives:
+        rule = compile_objective(obj, config.name)
+        if rule is not None:
+            rules.append(rule)
+    return rules
+
+
+def uncompiled_objectives(config) -> list[str]:
+    """Ids of objectives whose ``sequence`` (kill-chain) detection intent this compiler cannot yet
+    emit as a validated rule — Sigma correlation support is a follow-on. This includes an objective
+    that *also* has single-event ``detect`` signals (its detect half compiles; the sequence half
+    does not), so the ordered-chain intent is surfaced rather than silently dropped. Descriptive-
+    only objectives (no detect, no sequence) are omitted: nothing to detect, nothing missing."""
+    return [obj.id for obj in config.objectives if obj.sequence is not None]
+
+
 __all__ = [
-    "EPHEMERAL_FIELDS", "Validation", "generate", "matched_indices",
-    "parse_events", "rule_fields", "rule_matches", "validate",
+    "EPHEMERAL_FIELDS", "Validation", "compile_objective", "from_objectives", "generate",
+    "matched_indices", "parse_events", "rule_fields", "rule_matches", "uncompiled_objectives",
+    "validate",
 ]
