@@ -158,6 +158,18 @@ Example event (an HTTP hit on a planted vuln):
 Build a range that mirrors a real environment in two steps: **discover** the topology,
 then **capture** each service's real behavior so its weaknesses carry through.
 
+> **What capture touches — read this before running it on production.** Capture is **read-only**.
+> It connects **only to the host you name** — it never scans your network, follows links off-host, or
+> reaches any other system — and enumerates at your access level using the same requests a recon tool
+> makes (anonymous by default; authenticated only if you pass credentials). It **never writes to,
+> modifies, or deletes anything** on the target. The captured twin is written **only to your local
+> output file** (plus a `.capture-report.md` provenance sidecar) — **nothing is sent anywhere**: no
+> telemetry, no phone-home. Every run prints exactly what it connected to and where it wrote. The
+> capture code is a few hundred lines of mostly-stdlib Python in
+> [`rangefinder/capture/`](rangefinder/capture/) — auditable in a sitting. Captured content can
+> include secrets readable at your access level; `--scrub` redacts them (see below), and you should
+> review the twin before sharing it.
+
 ```bash
 # 1. discover — nmap fingerprints what's listening -> a config skeleton
 nmap -sV -oX scan.xml 10.0.0.0/24

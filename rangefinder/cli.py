@@ -50,7 +50,14 @@ def main(argv: list[str] | None = None) -> int:
     p_imp_nmap.add_argument("--name", default="imported", help="range name")
     p_imp_nmap.add_argument("--subnet", default=None, help="override the derived subnet CIDR")
 
-    p_capture = sub.add_parser("capture", help="record a live service into a faithful facade")
+    p_capture = sub.add_parser(
+        "capture", help="record a live service into a faithful facade",
+        description="Record a live service into a faithful twin. Capture is READ-ONLY: it connects "
+                    "only to the host you name (no network scan, no other systems), enumerates at "
+                    "your access level (the same requests a recon tool makes), and never writes to or "
+                    "modifies the target. Captured data — which may include secrets it can read — is "
+                    "written only to your local output file (+ a .capture-report.md provenance "
+                    "sidecar); nothing is sent anywhere. Use --scrub to redact secrets.")
     capture_sub = p_capture.add_subparsers(dest="captor", required=True)
     p_cap_http = capture_sub.add_parser("http", help="crawl a live web server -> http facade")
     p_cap_http.add_argument("url", help="base URL, e.g. https://10.0.0.5/")
@@ -298,6 +305,22 @@ def cmd_capture(args) -> int:
     from urllib.parse import urlparse
 
     capture_report = None  # every captor returns a provenance report; written as a sidecar below
+
+    # Trust banner: capture is the only part that touches production, so state plainly what it does
+    # BEFORE it connects. Every claim here is enforced by the code (read-only, single-host, local-only)
+    # — see the capture/ modules. Printed to stderr so it never pollutes a piped config on stdout.
+    _target = getattr(args, "host", None) or getattr(args, "url", None) or "the target"
+    _authed = bool(getattr(args, "username", "") or getattr(args, "bind_dn", "") or getattr(args, "password", ""))
+    _dest = str(args.out) if getattr(args, "out", None) else "stdout"
+    print(
+        f"capture: read-only enumeration of {_target} "
+        f"({'authenticated' if _authed else 'anonymous / unauthenticated'}).\n"
+        "  · connects only to this host — no network scan, no other systems reached\n"
+        "  · never writes to, modifies, or deletes anything on the target (read-only)\n"
+        f"  · captured data — including any secrets readable at this access level — is written only to "
+        f"{_dest}; nothing is sent anywhere (no telemetry, no phone-home)\n"
+        "  · review the twin and its .capture-report.md before sharing; pass --scrub to redact secrets",
+        file=sys.stderr)
 
     if args.captor == "http":
         from rangefinder.capture import capture_http
