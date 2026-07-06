@@ -170,3 +170,93 @@ def test_composition_is_deterministic():
 def _as_json(graph):
     import dataclasses
     return dataclasses.asdict(graph)
+
+
+# ------------------------------------------------- live verification (annotate_live)
+
+from rangefinder.paths import annotate_live  # noqa: E402
+
+
+def _two_hop_cfg():
+    return _cfg(
+        hosts=[
+            _smb("h1", "10.0.0.10", [
+                {"name": "Public", "files": {"note.txt": "log in with PasswordAAA111"}}]),
+            _smb("h2", "10.0.0.11", [
+                {"name": "Private", "restrict_anonymous": True,
+                 "files": {"backup.ini": "cred=PasswordBBB222"}}]),
+        ],
+        identities={"domain": "corp.local", "users": [
+            {"sam": "svca", "password": "PasswordAAA111"},
+            {"sam": "svcb", "password": "PasswordBBB222"}]},
+    )
+
+
+def _by_user(graph):
+    return {u: r for r in graph.reachable for u in r.usernames}
+
+
+def test_annotate_confirmed_live_when_pivot_authenticates():
+    graph = compose_paths(_two_hop_cfg())
+    # the svcb path pivots through (h2, smb, svca); mark that credential live
+    annotate_live(graph, {("h2", "smb", "svca", ""): "measured-live"})
+    svcb = _by_user(graph)["svcb"]
+    assert svcb.path_verdict == "confirmed-live"
+    svca = _by_user(graph)["svca"]
+    assert svca.path_verdict == "anonymous"  # 0-pivot, recovered from anonymous text
+
+
+def test_annotate_refuted_breaks_the_path():
+    graph = compose_paths(_two_hop_cfg())
+    # if svca does NOT actually authenticate to h2 live, the composed svcb path does not exist
+    annotate_live(graph, {("h2", "smb", "svca", ""): "refuted"})
+    assert _by_user(graph)["svcb"].path_verdict == "refuted"
+
+
+def test_annotate_untested_when_pivot_unprobed():
+    graph = compose_paths(_two_hop_cfg())
+    annotate_live(graph, {})  # no verdicts -> pivots default untested
+    assert _by_user(graph)["svcb"].path_verdict == "untested"
+
+
+def test_annotate_tags_grant_verdicts():
+    graph = compose_paths(_two_hop_cfg())
+    annotate_live(graph, {("h1", "smb", "svca", ""): "measured-live",
+                          ("h2", "smb", "svca", ""): "refuted"})
+    svca = _by_user(graph)["svca"]
+    assert svca.grant_verdicts["smb@h1"] == "measured-live"
+    assert svca.grant_verdicts["smb@h2"] == "refuted"
+
+
+def test_collapse_verdicts_keeps_strongest_per_edge():
+    from rangefinder.paths import collapse_verdicts
+    # dc01 exposes ldap on 389 (live) and 636 (untested) -> the grant is measured-live (works on one).
+    v = collapse_verdicts([
+        ("dc01", "ldap", "svc", "", "untested"),
+        ("dc01", "ldap", "svc", "", "measured-live"),
+        ("dc01", "ldap", "svc", "", "untested"),
+        ("fs01", "smb", "svc", "", "refuted"),
+        ("fs01", "smb", "svc", "", "untested"),
+    ])
+    assert v[("dc01", "ldap", "svc", "")] == "measured-live"  # any-live wins over later untested
+    assert v[("fs01", "smb", "svc", "")] == "refuted"          # refuted beats untested, nothing live
+
+
+def test_http_verdicts_are_scoped_per_route_not_masked_by_username():
+    # Two auth-gated routes share username 'admin' with DIFFERENT passwords, both leaked in an anon
+    # page. /admin authenticates live; /reports is refuted. The refuted route must NOT be promoted
+    # to measured-live by the live /admin verdict (the over-promotion the review caught).
+    cfg = _cfg([{
+        "id": "web", "hostname": "web", "ip": "10.0.0.10", "services": [
+            {"type": "http", "port": 80, "paths": {
+                "/pub": {"body": "creds: AdminPassOne111 and AdminPassTwo222"},
+                "/admin": {"body": "secret A", "auth_realm": "x",
+                           "auth_users": {"admin": "AdminPassOne111"}},
+                "/reports": {"body": "secret B", "auth_realm": "x",
+                             "auth_users": {"admin": "AdminPassTwo222"}}}}]}])
+    graph = compose_paths(cfg)
+    annotate_live(graph, {("web", "http", "admin", "/admin"): "measured-live",
+                          ("web", "http", "admin", "/reports"): "refuted"})
+    by_route = {g["qualifier"]: r for r in graph.reachable for g in r.grant_targets}
+    assert by_route["/admin"].grant_verdicts["http@web/admin"] == "measured-live"
+    assert by_route["/reports"].grant_verdicts["http@web/reports"] == "refuted"  # not masked

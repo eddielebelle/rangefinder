@@ -193,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         "paths", help="compose multi-hop credential attack paths across the estate twin")
     p_paths.add_argument("config", type=Path)
     p_paths.add_argument("--json", action="store_true", help="emit the attack graph as JSON")
+    p_paths.add_argument("--verify", action="store_true",
+                         help="probe each path edge against the live estate (needs --target), "
+                              "promoting advisory paths to confirmed-live / refuted / untested")
+    p_paths.add_argument("--target", action="append", default=[], metavar="ID=ADDR[:PORT]",
+                         help="live address for a config host id (repeatable), used with --verify")
+    p_paths.add_argument("--timeout", type=float, default=5.0, help="per-probe timeout (seconds)")
 
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
@@ -622,7 +628,7 @@ def cmd_coherence(args) -> int:
 def cmd_paths(args) -> int:
     import dataclasses
 
-    from rangefinder.paths import compose_paths, format_graph
+    from rangefinder.paths import annotate_live, collapse_verdicts, compose_paths, format_graph
 
     try:
         cfg = load_config(args.config)
@@ -630,6 +636,27 @@ def cmd_paths(args) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG
     graph = compose_paths(cfg)
+
+    if args.verify:
+        # Promote advisory edges to measured: probe each credential against the live estate (reusing
+        # verify_estate's per-credential tiering) and annotate every pivot / grant with its verdict.
+        from rangefinder.verify import verify_estate
+
+        if not args.target:
+            print("--verify needs at least one --target ID=ADDR[:PORT]", file=sys.stderr)
+            return EXIT_CONFIG
+        try:
+            targets = _parse_targets(args.target)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        report = verify_estate(cfg, targets, timeout=args.timeout)
+        verdicts = collapse_verdicts(
+            (r.host_id, r.kind, r.username, r.qualifier, r.verdict) for r in report.results)
+        annotate_live(graph, verdicts)
+        for note in report.boundary:
+            print(f"note: {note}", file=sys.stderr)
+
     if args.json:
         # Never emit raw secrets — the dataclasses carry only masked ids and usernames.
         print(json.dumps(dataclasses.asdict(graph), indent=2))
