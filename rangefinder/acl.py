@@ -319,4 +319,13 @@ def format_acl_report(report: AclReport) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["AclEdge", "AclReport", "analyze_acls", "format_acl_report"]
+def entry_label(entry) -> str:
+    """Public alias — the readable name (sAMAccountName/cn) other modules use to match principals."""
+    return _entry_label(entry)
+
+
+def norm_dn(dn: str) -> str:
+    return _norm_dn(dn)
+
+
+__all__ = ["AclEdge", "AclReport", "analyze_acls", "entry_label", "format_acl_report", "norm_dn"]
