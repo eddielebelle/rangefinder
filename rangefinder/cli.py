@@ -117,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_detect = sub.add_parser(
         "detect", help="generate + validate SIEM (Sigma) detections from telemetry")
+    p_detect.add_argument("config", type=Path, nargs="?", default=None,
+                          help="range config: compile its objectives into Sigma rules too")
     p_detect.add_argument("--attack", required=True,
                           help="attack telemetry JSONL (labelled malicious), or - for stdin")
     p_detect.add_argument("--benign", default=None,
@@ -709,16 +711,37 @@ def cmd_detect(args) -> int:
     if args.rule:
         rules = [yaml.safe_load(args.rule.read_text(encoding="utf-8"))]
     else:
+        # Two rule sources, complementary: the generic technique templates present in the attack
+        # log, plus this range's own objectives compiled straight to Sigma. Both are then held to
+        # the same ground-truth bar below, so a compiled objective that never fired is dropped.
         rules = det.generate(attack)
+        if args.config is not None:
+            try:
+                cfg = load_config(args.config)
+            except ConfigError as exc:
+                print(str(exc), file=sys.stderr)
+                return EXIT_CONFIG
+            seen_ids = {r.get("id") for r in rules if r.get("id")}
+            for rule in det.from_objectives(cfg):
+                if rule.get("id") not in seen_ids:  # a passed --rule id can pre-empt a compile
+                    rules.append(rule)
+            uncompiled = det.uncompiled_objectives(cfg)
+            if uncompiled:
+                print(f"note: {len(uncompiled)} sequence objective(s) not compiled "
+                      f"(kill chains need Sigma correlation rules): {', '.join(uncompiled)}\n",
+                      file=sys.stderr)
         if not rules:
-            print("no known techniques found in the attack telemetry", file=sys.stderr)
+            print("no known techniques in the attack telemetry and no objectives to compile"
+                  if args.config is not None else
+                  "no known techniques found in the attack telemetry", file=sys.stderr)
             return EXIT_ERROR
 
     print(f"Detections vs telemetry  (attack: {len(attack)} events, benign: {len(benign)} events)\n")
     validated: list[dict] = []
     for rule in rules:
         v = det.validate(rule, attack, benign)
-        print(f"  [{'PASS' if v.ok else 'FAIL'}] {v.title}")
+        origin = f"  [obj:{rule['rangefinder_objective']}]" if rule.get("rangefinder_objective") else ""
+        print(f"  [{'PASS' if v.ok else 'FAIL'}] {v.title}{origin}")
         print(f"         TP {v.true_positives}/{v.attack_total}   "
               f"FP {v.false_positives}/{v.benign_total}   -> {v.verdict}")
         if v.ok:
@@ -727,9 +750,15 @@ def cmd_detect(args) -> int:
 
     if args.out and validated:
         args.out.mkdir(parents=True, exist_ok=True)
+        used: set[str] = set()
         for rule in validated:
-            slug = re.sub(r"[^a-z0-9]+", "-", str(rule.get("title", "rule")).lower()).strip("-")
-            (args.out / f"{slug}.yml").write_text(
+            slug = re.sub(r"[^a-z0-9]+", "-", str(rule.get("title", "rule")).lower()).strip("-") or "rule"
+            name = slug
+            n = 2
+            while name in used:  # two rules with the same title slug must not clobber each other
+                name, n = f"{slug}-{n}", n + 1
+            used.add(name)
+            (args.out / f"{name}.yml").write_text(
                 yaml.safe_dump(rule, sort_keys=False, allow_unicode=True))
         print(f"wrote {len(validated)} rule(s) to {args.out}/")
     return EXIT_OK if validated else EXIT_ERROR
