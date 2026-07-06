@@ -189,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
     p_coh.add_argument("--strict", action="store_true",
                        help="exit nonzero if any coherence findings are reported (for CI gating)")
 
+    p_paths = sub.add_parser(
+        "paths", help="compose multi-hop credential attack paths across the estate twin")
+    p_paths.add_argument("config", type=Path)
+    p_paths.add_argument("--json", action="store_true", help="emit the attack graph as JSON")
+
     p_up = sub.add_parser("up", help="docker compose up -d in an output directory")
     p_up.add_argument("-o", "--out", type=Path, default=Path("."))
 
@@ -204,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture": cmd_capture,
         "merge": cmd_merge,
         "coherence": cmd_coherence,
+        "paths": cmd_paths,
         "score": cmd_score,
         "detect": cmd_detect,
         "verify": cmd_verify,
@@ -610,6 +616,25 @@ def cmd_coherence(args) -> int:
     # any finding into a nonzero exit for CI gating.
     if args.strict and report.has_findings:
         return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_paths(args) -> int:
+    import dataclasses
+
+    from rangefinder.paths import compose_paths, format_graph
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    graph = compose_paths(cfg)
+    if args.json:
+        # Never emit raw secrets — the dataclasses carry only masked ids and usernames.
+        print(json.dumps(dataclasses.asdict(graph), indent=2))
+    else:
+        print(format_graph(graph))
     return EXIT_OK
 
 
