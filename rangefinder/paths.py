@@ -71,7 +71,12 @@ class ReachableCredential:
     usernames: list[str]
     grants: list[str]          # "kind@host" targets this credential unlocks
     steps: list[str]           # ordered human-readable path from anonymous to the loot
-    hops: int                  # number of authenticate-and-loot rounds (0 = anonymously readable)
+    hops: int                  # number of authentication pivots (0 = recovered from anonymous text)
+    # Structured views used by live verification (annotate_live); empty until then.
+    pivots: list = field(default_factory=list)         # {host_id,kind,username} — each auth step on the path
+    grant_targets: list = field(default_factory=list)  # {host_id,kind,qualifier,username} this cred unlocks
+    grant_verdicts: dict = field(default_factory=dict) # "kind@host" -> measured-live | refuted | untested
+    path_verdict: str | None = None                    # confirmed-live | refuted | untested | anonymous
 
 
 @dataclass
@@ -231,10 +236,13 @@ def compose_paths(cfg: RangeConfig) -> AttackGraph:
         usernames = sorted(p.usernames)
         if sid in looted_at:
             steps = _steps_to_principal(sid, looted_at, unlocked_by, principals)
+            pivots = _pivots_to_principal(sid, looted_at, unlocked_by)
+            grant_targets = [{"host_id": h, "kind": k, "qualifier": q, "username": u}
+                             for h, k, q, u in sorted(p.grants)]
             # hops = number of authentication pivots (0 = recovered from anonymously-readable text).
             graph.reachable.append(ReachableCredential(
                 secret_id=sid, usernames=usernames, grants=grants,
-                steps=steps, hops=sum(1 for s in steps if s.startswith("authenticate to "))))
+                steps=steps, hops=len(pivots), pivots=pivots, grant_targets=grant_targets))
         else:
             graph.unreachable.append(UnreachableCredential(
                 secret_id=sid, usernames=usernames, grants=grants,
@@ -272,13 +280,86 @@ def _steps_to_principal(sid, looted_at, unlocked_by, principals, seen: set | Non
         f"read {loc.label}", recover]
 
 
+def _pivots_to_principal(sid, looted_at, unlocked_by, seen=None) -> list[dict]:
+    """The ordered authentication pivots on the path to *sid* — each an iter_credentials claim
+    ``(host_id, kind, username)`` that live verification can probe with validate_credential."""
+    seen = seen if seen is not None else set()
+    return _pivots_to_location(looted_at[sid], looted_at, unlocked_by, seen)
+
+
+def _pivots_to_location(loc: _Location, looted_at, unlocked_by, seen) -> list[dict]:
+    by = unlocked_by.get(loc)
+    if by is None or loc in seen:
+        return []
+    seen = seen | {loc}
+    sid, who = by  # authenticated to loc.host_id (loc.kind) as `who` to read this location
+    return _pivots_to_location(looted_at[sid], looted_at, unlocked_by, seen) + [
+        {"host_id": loc.host_id, "kind": loc.kind, "qualifier": loc.qualifier, "username": who}]
+
+
+_VERDICT_PRECEDENCE = {"measured-live": 3, "refuted": 2, "untested": 1}
+
+
+def collapse_verdicts(edges) -> dict:
+    """Collapse per-service edge verdicts into one per ``(host_id, kind, username, qualifier)``,
+    keeping the strongest. A host may expose the same kind on several ports (ldap 389 AND 636), so
+    verify_estate yields several results per credential; the grant is measured-live if the credential
+    authenticates on ANY matching service, refuted only when nothing was live. The ``qualifier`` (the
+    HTTP route) MUST stay in the key: HTTP auth is per-route, so a live cred on one route must not
+    mask a refuted cred sharing the username on another. ``edges`` is an iterable of
+    ``(host_id, kind, username, qualifier, verdict)``."""
+    out: dict = {}
+    for host_id, kind, username, qualifier, verdict in edges:
+        key = (host_id, kind, username, qualifier)
+        if key not in out or _VERDICT_PRECEDENCE[verdict] > _VERDICT_PRECEDENCE[out[key]]:
+            out[key] = verdict
+    return out
+
+
+def annotate_live(graph: AttackGraph, verdicts: dict) -> None:
+    """Promote the graph from advisory to measured, in place, using live edge verdicts.
+
+    ``verdicts`` maps ``(host_id, kind, username, qualifier)`` -> "measured-live" | "refuted" |
+    "untested" (exactly the tiers ``verify_estate`` produces per credential; qualifier is the HTTP
+    route, "" otherwise). Each reachable credential's grants and each authentication pivot on its
+    path are tagged, and the path gets an overall verdict:
+
+    - **confirmed-live**: every pivot authenticates on the live estate — the chain really works.
+    - **refuted**: a pivot was rejected live — the composed path does not exist on the real estate.
+    - **untested**: a pivot could not be probed (no target / unreachable) and none was refuted.
+    - **anonymous**: no authentication pivot (recovered from anonymously-readable text); the auth
+      chain is trivially satisfied, though anonymous *readability* itself is not probed by this pass.
+    """
+    for r in graph.reachable:
+        for g in r.grant_targets:
+            key = (g["host_id"], g["kind"], g["username"], g.get("qualifier", ""))
+            label = f'{g["kind"]}@{g["host_id"]}' + (g.get("qualifier") or "")
+            r.grant_verdicts[label] = verdicts.get(key, "untested")
+        pv = [verdicts.get((p["host_id"], p["kind"], p["username"], p.get("qualifier", "")), "untested")
+              for p in r.pivots]
+        if not pv:
+            r.path_verdict = "anonymous"
+        elif any(v == "refuted" for v in pv):
+            r.path_verdict = "refuted"
+        elif all(v == "measured-live" for v in pv):
+            r.path_verdict = "confirmed-live"
+        else:
+            r.path_verdict = "untested"
+
+
 def format_graph(graph: AttackGraph) -> str:
     lines: list[str] = []
+    verified = any(r.path_verdict for r in graph.reachable)
     if graph.reachable:
-        lines.append(f"Reachable credentials ({len(graph.reachable)}) — advisory paths, confirm with `verify estate`:")
+        header = ("Reachable credentials — live-verified against the estate:" if verified
+                  else "Reachable credentials — advisory paths, confirm with `verify estate` or `paths --verify`:")
+        lines.append(f"{header}  ({len(graph.reachable)})")
         for r in graph.reachable:
             names = ", ".join(r.usernames)
-            lines.append(f"\n  ‣ {names} [{r.secret_id}]  ({r.hops}-hop)  unlocks: {', '.join(r.grants)}")
+            verdict = f"  [{r.path_verdict}]" if r.path_verdict else ""
+            unlocks = ", ".join(
+                g + (f"({r.grant_verdicts[g]})" if g in r.grant_verdicts else "") for g in r.grants)
+            lines.append(f"\n  ‣ {names} [{r.secret_id}]  ({r.hops}-hop){verdict}  unlocks: {unlocks}")
             for i, step in enumerate(r.steps):
                 lines.append(f"      {'└─' if i == len(r.steps) - 1 else '├─'} {step}")
     else:
@@ -294,5 +375,5 @@ def format_graph(graph: AttackGraph) -> str:
 
 __all__ = [
     "AttackGraph", "ReachableCredential", "UnreachableCredential",
-    "compose_paths", "format_graph",
+    "annotate_live", "collapse_verdicts", "compose_paths", "format_graph",
 ]

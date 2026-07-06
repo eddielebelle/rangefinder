@@ -719,6 +719,10 @@ class EdgeResult:
     verdict: str                   # measured-live | refuted | untested
     leaked_at: list[str] = field(default_factory=list)
     note: str = ""
+    # HTTP auth is per-route, so the verdict is scoped to this path; "" for kinds without a route.
+    # Consumers keying credential edges (e.g. `paths --verify`) must include this or a live cred on
+    # one route would mask a refuted cred sharing the username on another.
+    qualifier: str = ""
 
     @property
     def exploitable(self) -> bool:
@@ -783,7 +787,7 @@ def verify_estate(cfg: RangeConfig, targets: dict, *, timeout: float = 5.0) -> E
         if hid not in targets:
             report.results.append(EdgeResult(
                 claim["kind"], hid, claim["username"], claim["origin"], "-", "untested",
-                leaked_at, "no --target for this host"))
+                leaked_at, "no --target for this host", qualifier=claim.get("path", "")))
             continue
         addr, tport = targets[hid]
         if tport is not None and len(host_ports[hid]) == 1:
@@ -805,7 +809,7 @@ def verify_estate(cfg: RangeConfig, targets: dict, *, timeout: float = 5.0) -> E
                 else "probe inconclusive (unreachable / unsupported)")
         report.results.append(EdgeResult(
             claim["kind"], hid, claim["username"], claim["origin"], f"{addr}:{port}", tier,
-            leaked_at, note))
+            leaked_at, note, qualifier=claim.get("path", "")))
 
     if report.untested:
         report.boundary.append(
