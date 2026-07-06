@@ -588,3 +588,44 @@ def test_select_dialect_ignores_negotiate_context_noise():
     recv = smb2.SMB2Packet(pkt.getData())
     # 3.1.1-only client, ceiling 3.0 -> no common dialect -> fall back (None), never the noise
     assert _select_dialect(smb2, recv, False, 0x0300) is None
+
+
+def test_smb1_negotiate_fingerprints_as_microsoft_ds_not_router():
+    """nmap -sV probes SMB with an SMB1 multi-protocol negotiate (SMBProgNeg). impacket's fallback
+    answers with a minimal DialectIndex=0xFFFF response that nmap hard-matches as 'routersetup'
+    (a Nortel/D-Link router) — a fidelity tell. The facade must instead answer like Windows (NT LM
+    0.12 with a full NT-security body, Flags1 0x88) so nmap reports microsoft-ds."""
+    import re
+    import socket
+
+    from rangefinder.config.services import SmbConfig, SmbShare
+
+    probe = (b"\x00\x00\x00\xa4\xffSMBr\x00\x00\x00\x00\x08\x01\x40\x00\x00\x00\x00\x00\x00"
+             b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x06\x00\x00\x01\x00\x00\x81\x00\x02"
+             b"PC NETWORK PROGRAM 1.0\x00\x02MICROSOFT NETWORKS 1.03\x00\x02MICROSOFT NETWORKS 3.0\x00"
+             b"\x02LANMAN1.0\x00\x02LM1.2X002\x00\x02Samba\x00\x02NT LANMAN 1.0\x00\x02NT LM 0.12\x00")
+    cfg = SmbConfig(port=_free_port(), smb1_enabled=False, shares=[SmbShare(name="D")])
+    facade = _serve(cfg, "fs01")
+
+    async def run():
+        await facade.start()
+        try:
+            loop = asyncio.get_running_loop()
+
+            def send():
+                s = socket.create_connection(("127.0.0.1", facade.port), 5)
+                s.sendall(probe)
+                s.settimeout(4)
+                data = s.recv(4096)
+                s.close()
+                return data
+
+            return await loop.run_in_executor(None, send)
+        finally:
+            await facade.stop()
+
+    resp = asyncio.run(run())
+    # microsoft-ds: SMB1 NEGOTIATE reply, Flags1 0x88, then the rich NT-security body
+    assert re.match(rb"^\x00\x00\x00.\xffSMBr\x00\x00\x00\x00\x88\x01@", resp, re.S)
+    # NOT routersetup: the minimal Flags1 0x80 / DialectIndex 0xFFFF reply
+    assert not re.match(rb"^\x00\x00\x00.\xffSMBr\x00\x00\x00\x00\x80", resp, re.S)

@@ -17,9 +17,10 @@ refuses a null-session tree connect — so a captured access decision is reprodu
 served wide open.
 
 Fidelity of the security posture: the facade honours captured fields rather than shipping
-impacket's permissive defaults — `smb1_enabled=False` refuses the legacy SMB1 negotiate,
-`reject_unknown_users` refuses bogus logons instead of mapping them to guest, and the negotiate
-advertises the captured `max_dialect` even on the default SMB1-multiprotocol negotiate path.
+impacket's permissive defaults — `smb1_enabled=False` answers the legacy SMB1 negotiate like a
+modern Windows host (so `nmap -sV` fingerprints it as `microsoft-ds`, not the router impacket's
+minimal fallback resembles) while refusing the SMB1 *session*, `reject_unknown_users` refuses bogus
+logons instead of mapping them to guest, and the negotiate advertises the captured `max_dialect`.
 All default to the restrictive (fail-closed) value so an unmeasured posture never over-exposes
 the twin. One SMB facade per host is assumed (the log handler is process-wide).
 """
@@ -358,33 +359,66 @@ class SmbFacade(Facade):
 
     # ---- SMB1 availability ------------------------------------------------------
     def _install_smb1_policy(self, inner) -> None:
-        """Refuse the legacy SMB1 (NT LM 0.12) negotiate, as a modern host with SMB1 disabled does.
+        """Answer the legacy SMB1 negotiate like a modern Windows host, then refuse SMB1 *sessions*.
 
-        A client that offers only SMB1 dialects (no ``SMB 2.002`` / ``SMB 2.???``) makes impacket
-        fall back to its SMB1 negotiate handler and answer NT LM 0.12 — so the twin speaks SMB1
-        even though the captured host doesn't. We replace that handler with one that returns an
-        SMB1 negotiate response whose DialectIndex is 0xFFFF ("none of your dialects accepted"),
-        the protocol-correct refusal. An SMB1-only client then fails to negotiate exactly as it
-        does against the real host — a clean rejection, not an emulator error. SMB2/3 clients are
-        untouched (they never reach the SMB1 handler).
+        A client that offers only SMB1 dialects (no ``SMB 2.002`` / ``SMB 2.???``) — nmap's ``-sV``
+        ``SMBProgNeg`` probe is exactly this — makes impacket fall back to its SMB1 negotiate handler,
+        which selects DialectIndex 0xFFFF ("no dialect"). That minimal reply matches nmap's
+        *routersetup* fingerprint, so the twin fingerprints as a "Nortel/D-Link router" instead of
+        Windows — a tell (and worse than useless, since the fix must read as ``microsoft-ds``).
+
+        A real modern Windows host answers the SMB1 negotiate by selecting NT LM 0.12 with a full
+        NT-security response (which is how nmap's ``microsoft-ds`` fingerprints are keyed), and only
+        refuses the SMB1 *session* that follows. We reproduce that: the negotiate response below is
+        byte-shaped to match nmap's Windows ``microsoft-ds`` signature, and a paired hook refuses the
+        SMB1 SESSION_SETUP with STATUS_NOT_SUPPORTED — so `nmap -sV` reads the port as Windows SMB
+        while an actual SMB1 session still fails closed, exactly as against an SMB1-disabled host.
+        SMB2/3 clients never reach either hook.
         """
         import struct as _struct
 
         from impacket import smb
+        from impacket.nt_errors import STATUS_NOT_SUPPORTED
 
-        def _refuse(conn_id, smb_server, smb_command, recv_packet):
+        # NT LM 0.12 negotiate response parameters (17 words). The values (SecurityMode, MaxMpxCount,
+        # MaxBufferSize 0x1104, MaxRawSize 0x10000, Capabilities 0x0001e3fc) are the ones nmap's
+        # microsoft-ds signature matches; DialectIndex 7 selects NT LM 0.12 from the probe's list.
+        _params = _struct.pack(
+            "<HBHHLLLLLLHB",
+            7, 0x03, 10, 1, 0x1104, 0x10000, 0, 0x0001E3FC, 0, 0, 0, 8)
+
+        def _negotiate(conn_id, smb_server, smb_command, recv_packet):
             resp = smb.NewSMBPacket()
-            resp["Flags1"] = smb.SMB.FLAGS1_REPLY
+            resp["Flags1"] = 0x88            # FLAGS1_REPLY | PATHCASELESS — matches the fingerprint
+            resp["Flags2"] = 0x4001
             resp["Pid"] = recv_packet["Pid"]
             resp["Tid"] = recv_packet["Tid"]
             resp["Mid"] = recv_packet["Mid"]
+            resp["Uid"] = recv_packet["Uid"]
             cmd = smb.SMBCommand(smb.SMB.SMB_COM_NEGOTIATE)
-            cmd["Parameters"] = _struct.pack("<H", 0xFFFF)  # DialectIndex: no common dialect
+            cmd["Parameters"] = _params
+            cmd["Data"] = b"\x11\x22\x33\x44\x55\x66\x77\x88" + b"WORKGROUP\x00"  # challenge + domain
+            resp.addCommand(cmd)
+            return None, [resp], 0
+
+        def _refuse_session(conn_id, smb_server, smb_command, recv_packet):
+            resp = smb.NewSMBPacket()
+            resp["Flags1"] = 0x88
+            resp["Flags2"] = 0x4001
+            resp["Pid"] = recv_packet["Pid"]
+            resp["Tid"] = recv_packet["Tid"]
+            resp["Mid"] = recv_packet["Mid"]
+            resp["Uid"] = recv_packet["Uid"]
+            resp["ErrorCode"] = (STATUS_NOT_SUPPORTED >> 16) & 0xFFFF
+            resp["ErrorClass"] = STATUS_NOT_SUPPORTED & 0xFF
+            cmd = smb.SMBCommand(smb.SMB.SMB_COM_SESSION_SETUP_ANDX)
+            cmd["Parameters"] = b""
             cmd["Data"] = b""
             resp.addCommand(cmd)
-            return None, [resp], 0  # STATUS_SUCCESS carrying the "no dialect" answer
+            return None, [resp], STATUS_NOT_SUPPORTED
 
-        inner.hookSmbCommand(smb.SMB.SMB_COM_NEGOTIATE, _refuse)
+        inner.hookSmbCommand(smb.SMB.SMB_COM_NEGOTIATE, _negotiate)
+        inner.hookSmbCommand(smb.SMB.SMB_COM_SESSION_SETUP_ANDX, _refuse_session)
 
     # ---- access control ---------------------------------------------------------
     def _install_access_control(self, inner) -> None:
