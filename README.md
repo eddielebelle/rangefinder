@@ -4,13 +4,25 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
-Declarative cyber-range generator for **authorized** security testing. Author a fake
-network as one JSON file; rangefinder renders it into lightweight protocol **facades**
-that answer real recon/enumeration tooling (nmap, curl, dirb/gobuster, ldapsearch) and
-emit **SIEM-ready telemetry** for every interaction. No real AD domain, no real web app —
-just facades that respond convincingly enough to test against, and log everything.
+Generator for lightweight protocol **facades** that stand in for a real network + identity
+estate — answering real recon/enumeration tooling (nmap, curl, ldapsearch, impacket) accurately
+and emitting **SIEM-ready ECS telemetry** for every interaction, one container per host. For
+**authorized** security testing.
 
-Built for: detection/SOC evaluations, recon/enumeration tooling, and human red-teamers.
+**The point is capture, not authoring.** rangefinder can *capture* a live estate — SMB shares and
+files, LDAP directory objects + ACLs, auth posture — into a faithful, disposable **twin**, so a
+weakness is *carried from the real estate*, not planted. Turn autonomous red-team agents loose on
+the twin, off production, and what they find **transfers back** — because the twin was captured, not
+modeled. (You can also author a range as one JSON file, for demos and tests.)
+
+The loop this is one stage of:
+**capture → faithful twin → test with agents → harvest findings → emit detections.**
+
+Fidelity is a hard contract, not a hope: every posture field is *measured, else fails closed and
+says so* — so the twin can only under-report, never fabricate a finding an agent would "discover"
+that isn't on the real estate. That's what makes findings transfer. See **[DESIGN.md](DESIGN.md)**.
+
+Built for: detection/SOC evaluations, agentic red-team / purple-team pipelines, and human red-teamers.
 
 For the *why* — the problem it targets, the two-plane architecture, how fidelity is verified, the
 endpoint/EDR seam, and where it fits an agentic security stack — see **[DESIGN.md](DESIGN.md)**.

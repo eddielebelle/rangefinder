@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+
+# Capture artifacts may contain real secrets captured from a live estate — never commit them.
+*.capture-report.md
+examples/calderwood.json
