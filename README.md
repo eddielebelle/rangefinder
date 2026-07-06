@@ -1,7 +1,7 @@
 # rangefinder
 
 [![CI](https://github.com/eddielebelle/rangefinder/actions/workflows/ci.yml/badge.svg)](https://github.com/eddielebelle/rangefinder/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
 Generator for lightweight protocol **facades** that stand in for a real network + identity
@@ -338,6 +338,13 @@ orchestration layers pick it up automatically.
 pip install -e '.[dev]'
 pytest
 ```
+
+## License
+
+Licensed under the **GNU Affero General Public License v3.0** ([LICENSE](LICENSE)) — free to use,
+modify, and self-host, but any modified version offered over a network must make its source
+available. For a commercial license (to use rangefinder in a closed-source product or service),
+contact the author.
 
 ## Legal
 

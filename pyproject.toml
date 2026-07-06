@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Declarative cyber-range generator: JSON configs become protocol facades that answer real security tooling and emit SIEM-ready telemetry."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "Owain Mogford" }]
 dependencies = [
     "pydantic>=2.5",
