@@ -189,6 +189,13 @@ def main(argv: list[str] | None = None) -> int:
     p_coh.add_argument("--strict", action="store_true",
                        help="exit nonzero if any coherence findings are reported (for CI gating)")
 
+    p_acl = sub.add_parser(
+        "acl", help="analyse captured directory ACLs for privilege-escalation edges")
+    p_acl.add_argument("config", type=Path)
+    p_acl.add_argument("--json", action="store_true", help="emit the ACL edges as JSON")
+    p_acl.add_argument("--strict", action="store_true",
+                       help="exit nonzero if any privilege-escalation edge is found (CI gating)")
+
     p_paths = sub.add_parser(
         "paths", help="compose multi-hop credential attack paths across the estate twin")
     p_paths.add_argument("config", type=Path)
@@ -215,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture": cmd_capture,
         "merge": cmd_merge,
         "coherence": cmd_coherence,
+        "acl": cmd_acl,
         "paths": cmd_paths,
         "score": cmd_score,
         "detect": cmd_detect,
@@ -620,6 +628,26 @@ def cmd_coherence(args) -> int:
     print(format_report(report))
     # Advisory by default (findings are observations, not certain contradictions); --strict turns
     # any finding into a nonzero exit for CI gating.
+    if args.strict and report.has_findings:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_acl(args) -> int:
+    import dataclasses
+
+    from rangefinder.acl import analyze_acls, format_acl_report
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    report = analyze_acls(cfg)
+    if args.json:
+        print(json.dumps(dataclasses.asdict(report), indent=2))
+    else:
+        print(format_acl_report(report))
     if args.strict and report.has_findings:
         return EXIT_ERROR
     return EXIT_OK
