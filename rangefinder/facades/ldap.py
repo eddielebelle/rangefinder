@@ -914,10 +914,23 @@ def _partial_attr(pal, name: str, octets, types_only: bool):
     return pa
 
 
+# Attributes a real AD DC does NOT return for a bare ``*`` (or ``+``) — they must be named
+# explicitly. nTSecurityDescriptor is the notable one: SharpHound/BloodHound request it by name,
+# and a twin that volunteered it for ``*`` (when a real DC would not) would be a fidelity tell.
+_REQUEST_ONLY_ATTRS = {"ntsecuritydescriptor"}
+
+
 def _select_attrs(attrs: dict[str, list[str]], requested: list[str]) -> dict[str, list[str]]:
-    if not requested or "*" in requested:
-        return attrs
     if requested == ["1.1"]:  # RFC 4511: return no attributes
         return {}
     want = {r.lower() for r in requested}
-    return {k: v for k, v in attrs.items() if k.lower() in want}
+    all_wanted = not requested or "*" in requested
+    out: dict[str, list[str]] = {}
+    for k, v in attrs.items():
+        kl = k.lower()
+        if kl in _REQUEST_ONLY_ATTRS:
+            if kl in want:  # returned only when named, never volunteered for "*"
+                out[k] = v
+        elif all_wanted or kl in want:
+            out[k] = v
+    return out

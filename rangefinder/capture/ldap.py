@@ -22,6 +22,7 @@ import ssl
 
 from pyasn1.codec.ber import decoder, encoder
 from pyasn1.error import PyAsn1Error
+from pyasn1.type import namedtype, univ
 from pyasn1_modules import rfc2251 as L
 
 from rangefinder.capture.scrub import Scrubber
@@ -47,6 +48,40 @@ _BINARY_ATTRS = {
 # transient or protocol condition (confidentialityRequired, busy, unavailable, …). Only a refusal
 # of the *anonymous* bind is a hardened posture; anything else is a genuine capture error.
 _BIND_REFUSED = frozenset({48, 49, 53})  # inappropriateAuthentication / invalidCredentials / unwilling
+
+# nTSecurityDescriptor holds the object's ACL — owner, group, and the DACL that defines who can do
+# what to it. Those ACEs are exactly the edges BloodHound-style tooling walks to find attack paths
+# (GenericAll, WriteDacl, …), so an ACL-blind twin can't surface identity-plane privilege paths.
+# AD does NOT return nTSecurityDescriptor for a bare ``*`` — it must be requested by name, and the
+# request is scoped by the LDAP_SERVER_SD_FLAGS control below.
+_SD_ATTR = "nTSecurityDescriptor"
+
+# LDAP_SERVER_SD_FLAGS_OID: scopes which components of the security descriptor the server returns.
+# OWNER (1) | GROUP (2) | DACL (4) — deliberately NOT SACL (8). Reading the SACL (the audit ACL)
+# needs SeSecurityPrivilege, which an ordinary bind lacks; requesting it can make the server refuse
+# the whole attribute. An attacker at this access level can't read the SACL either, so omitting it
+# is faithful to what this bind can see, not a capture gap.
+_SD_FLAGS_OID = "1.2.840.113556.1.4.801"
+_SD_FLAGS_OWNER_GROUP_DACL = 0x07
+
+
+class _SDFlagsRequestValue(univ.Sequence):
+    """The controlValue payload for LDAP_SERVER_SD_FLAGS: ``SEQUENCE { flags INTEGER }``."""
+
+    componentType = namedtype.NamedTypes(namedtype.NamedType("flags", univ.Integer()))
+
+
+def _sd_flags_control(flags: int) -> tuple[str, bool, bytes]:
+    """Build the LDAP_SERVER_SD_FLAGS control as (oid, criticality, controlValue).
+
+    Criticality is FALSE so a directory that does not implement the control (OpenLDAP, a hardened
+    non-AD server) ignores it and the search still succeeds — it simply returns no security
+    descriptor rather than erroring. Against AD the control is honored regardless of criticality
+    and scopes nTSecurityDescriptor to the requested SD components.
+    """
+    value = _SDFlagsRequestValue()
+    value["flags"] = flags
+    return _SD_FLAGS_OID, False, encoder.encode(value)
 
 
 def _wrap_tls(sock):
@@ -115,10 +150,16 @@ def capture_ldap(
         if not anon_denied:
             if not ncs:
                 warnings.append("server advertised no namingContexts; captured RootDSE only")
+            # Request the ACL (nTSecurityDescriptor) alongside "*": it is not returned by the
+            # wildcard, so it must be named, and the SD_FLAGS control scopes it to owner/group/DACL
+            # (the parts this bind can read). Whatever the server actually returns is captured; a
+            # server that withholds it just yields no SD — fail-closed, never fabricated.
+            sd_control = _sd_flags_control(_SD_FLAGS_OWNER_GROUP_DACL)
             for nc in ncs:
                 if len(captured) >= max_entries:
                     break
-                captured.extend(_search(sock, counter.next(), nc, 2, ["*"], max_entries - len(captured)))
+                captured.extend(_search(sock, counter.next(), nc, 2, ["*", _SD_ATTR],
+                                        max_entries - len(captured), controls=[sd_control]))
         _unbind(sock, counter.next())
     finally:
         try:
@@ -155,6 +196,8 @@ def capture_ldap(
         entries.append(_entry(dn, attrs, battrs))
     n_entries = sum(1 for e in entries if e["dn"] != "")
     n_binary = sum(len(e.get("binary_attributes", {})) for e in entries)
+    n_acl = sum(1 for e in entries for k in e.get("binary_attributes", {})
+                if k.lower() == "ntsecuritydescriptor")
 
     service: dict = {"type": "ldap", "port": port}
     if tls:
@@ -182,6 +225,22 @@ def capture_ldap(
     if n_binary:
         report.measured("binary_attributes", n_binary,
                         "objectSid/GUID/cert/ACL values carried base64 and replayed as raw octets")
+    # ACLs (nTSecurityDescriptor) are the identity-plane attack-path edges. Surface them as their
+    # own provenance fact, distinct from the raw binary count, and be explicit about the SACL gap.
+    if not anon_denied:
+        if n_acl:
+            report.measured("security_descriptors", n_acl,
+                            "nTSecurityDescriptor (owner/group/DACL) captured via "
+                            "LDAP_SERVER_SD_FLAGS and replayed as raw octets for ACL analysis")
+            report.unmeasurable("sacl", "unknown",
+                                "system ACL (SACL/auditing) not requested — reading it needs "
+                                "SeSecurityPrivilege, which this bind lacks; an attacker at this "
+                                "access level cannot see it either")
+        else:
+            report.unmeasurable("security_descriptors", 0,
+                                "no nTSecurityDescriptor was readable at this bind; ACL-based "
+                                "attack paths were not captured — re-capture with a credential "
+                                "that can read object security to measure them")
     if anonymous:
         if anon_denied:
             report.measured("allow_anonymous_bind", False,
@@ -306,7 +365,8 @@ def _probe_anonymous_bind(host: str, port: int, *, tls: bool = False,
             pass
 
 
-def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> list[tuple[str, dict, dict]]:
+def _search(sock, mid: int, base: str, scope: int, attributes, limit: int,
+            controls: list[tuple[str, bool, bytes]] | None = None) -> list[tuple[str, dict, dict]]:
     msg = L.LDAPMessage()
     msg["messageID"] = mid
     sr = L.SearchRequest()
@@ -323,6 +383,18 @@ def _search(sock, mid: int, base: str, scope: int, attributes, limit: int) -> li
     for i, a in enumerate(attributes):
         attr_list.setComponentByPosition(i, a)
     msg["protocolOp"]["searchRequest"] = sr
+    if controls:
+        # LDAPMessage.controls is context-tagged [0]; instantiate it from the message's own schema
+        # so the tag matches, then fill each Control (controlType / criticality / controlValue).
+        ctrls = msg.componentType.getTypeByPosition(2).clone()
+        for i, (oid, criticality, value) in enumerate(controls):
+            c = ctrls.componentType.clone()
+            c["controlType"] = oid
+            c["criticality"] = criticality
+            if value is not None:
+                c["controlValue"] = value
+            ctrls.setComponentByPosition(i, c)
+        msg["controls"] = ctrls
     sock.sendall(encoder.encode(msg))
 
     out: list[tuple[str, dict]] = []
