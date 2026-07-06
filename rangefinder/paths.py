@@ -88,10 +88,21 @@ class UnreachableCredential:
 
 
 @dataclass
+class AclEscalation:
+    """A privilege-escalation reachable by combining a credential path with captured ACL control."""
+
+    target: str            # object an attacker can take control of
+    right: str             # the ACL right that grants the final step (or "DCSync")
+    steps: list[str]       # full chain from a reachable credential to the target
+    domain_compromise: bool = False
+
+
+@dataclass
 class AttackGraph:
     reachable: list[ReachableCredential] = field(default_factory=list)
     unreachable: list[UnreachableCredential] = field(default_factory=list)
     hosts_reached: list[str] = field(default_factory=list)   # hosts an anon-rooted path can access
+    escalations: list[AclEscalation] = field(default_factory=list)  # filled by escalate_via_acls
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -347,6 +358,153 @@ def annotate_live(graph: AttackGraph, verdicts: dict) -> None:
             r.path_verdict = "untested"
 
 
+def _princ_norm(name: str) -> str:
+    """Normalise a login/principal handle to a bare account name for matching (UPN/DOMAIN\\ stripped)."""
+    n = name.strip().lower()
+    if "@" in n:
+        n = n.split("@", 1)[0]
+    if "\\" in n:
+        n = n.split("\\", 1)[1]
+    return n
+
+
+def _group_membership(cfg) -> dict:
+    """principal (lowercased label) -> set of group labels it is (directly) a member of.
+
+    A member acts with the rights of the groups it belongs to, so controlling a principal extends
+    control through its group memberships. Built from captured ``memberOf`` (resolved group DN ->
+    the group entry's label) and from authored ``identities`` membership."""
+    from rangefinder.acl import entry_label, norm_dn
+
+    dn_label: dict = {}
+    entries: list = []
+    for host in cfg.hosts:
+        for svc in host.services:
+            if svc.type == "ldap":
+                for e in svc.entries:
+                    entries.append(e)
+                    dn_label[norm_dn(e.dn)] = entry_label(e).lower()
+
+    membership: dict = {}
+    for e in entries:
+        label = entry_label(e).lower()
+        if not label:
+            continue
+        for attr, vals in e.attributes.items():
+            if attr.lower() == "memberof":
+                for gdn in vals:
+                    g = dn_label.get(norm_dn(str(gdn)))
+                    if g:
+                        membership.setdefault(label, set()).add(g)
+    if cfg.identities:
+        for u in cfg.identities.users:
+            for g in u.groups:
+                if u.sam and g:
+                    membership.setdefault(u.sam.lower(), set()).add(g.lower())
+        for g in cfg.identities.groups:
+            for m in g.members:
+                if m and g.name:
+                    membership.setdefault(m.lower(), set()).add(g.name.lower())
+    return membership
+
+
+def escalate_via_acls(graph: AttackGraph, cfg) -> list[AclEscalation]:
+    """Extend the reachable credentials through captured ACL control edges.
+
+    Controlling a principal (a reachable credential) lets an attacker act with the rights of every
+    group it is transitively a member of, and any ``GenericAll`` / ``WriteDacl`` / ``WriteOwner`` /
+    ``Owns`` / ``ForceChangePassword`` / ``AddMember`` / ``GenericWrite`` / ``AllExtendedRights`` edge
+    from a controlled principal takes control of its target — which expands again to a fixpoint.
+    ``DCSync`` on the domain is full compromise.
+
+    Advisory, same discipline as the credential graph: only *reachable-credential* seeds and *measured*
+    ACL edges feed it, and the principal match (login handle -> captured object label) is inferred, not
+    certified. Populates and returns ``graph.escalations``."""
+    from rangefinder.acl import analyze_acls
+
+    edges = analyze_acls(cfg).edges
+    if not edges or not graph.reachable:
+        return []
+    membership = _group_membership(cfg)
+
+    def with_groups(label: str, into: set) -> None:
+        stack = [label]
+        while stack:
+            p = stack.pop()
+            for g in membership.get(p, ()):
+                if g not in into:
+                    into.add(g)
+                    stack.append(g)
+
+    # Seed: every reachable credential's account names, plus the groups they belong to.
+    controlled: set = set()
+    origin: dict = {}  # label -> (kind, ...) for chain reconstruction; seed principals map to a cred
+    for r in graph.reachable:
+        for u in r.usernames:
+            p = _princ_norm(u)
+            if not p:
+                continue  # a degenerate handle ("@dom", "DOM\\", "") must never seed control
+            if p not in origin:
+                origin[p] = ("seed", u)
+            controlled.add(p)
+    seeds = set(controlled)
+    for s in seeds:
+        before = set(controlled)
+        with_groups(s, controlled)
+        for g in controlled - before:
+            origin.setdefault(g, ("member", s))  # controlled by membership of a seed
+
+    escalations: list[AclEscalation] = []
+    dcsync_done = False
+    changed = True
+    while changed:
+        changed = False
+        for e in edges:
+            trustee = e.trustee.lower()
+            target = e.object_name.lower()
+            if not trustee or not target:
+                continue  # an empty-labelled principal (blank sAMAccountName) is not a real match
+            if trustee not in controlled:
+                continue
+            if e.right == "DCSync":
+                if not dcsync_done:
+                    dcsync_done = True
+                    changed = True
+                    escalations.append(AclEscalation(
+                        target="<domain>", right="DCSync", domain_compromise=True,
+                        steps=_esc_chain(trustee, origin) + ["[DCSync] replicate domain secrets — full compromise"]))
+                continue
+            if target in controlled:
+                continue
+            controlled.add(target)
+            origin[target] = ("acl", trustee, e.right, e.object_name)
+            escalations.append(AclEscalation(
+                target=e.object_name, right=e.right,
+                steps=_esc_chain(target, origin)))
+            before = set(controlled)
+            with_groups(target, controlled)
+            for g in controlled - before:
+                origin.setdefault(g, ("member", target))
+            changed = True
+
+    graph.escalations = escalations
+    return escalations
+
+
+def _esc_chain(label: str, origin: dict, seen: set | None = None) -> list[str]:
+    seen = seen if seen is not None else set()
+    entry = origin.get(label)
+    if entry is None or label in seen:
+        return [f"control {label}"]
+    seen = seen | {label}
+    if entry[0] == "seed":
+        return [f"control {entry[1]} (reachable credential)"]
+    if entry[0] == "member":
+        return _esc_chain(entry[1], origin, seen) + [f"acts as group {label}"]
+    _, via, right, disp = entry
+    return _esc_chain(via, origin, seen) + [f"[{right}] control {disp}"]
+
+
 def format_graph(graph: AttackGraph) -> str:
     lines: list[str] = []
     verified = any(r.path_verdict for r in graph.reachable)
@@ -368,12 +526,19 @@ def format_graph(graph: AttackGraph) -> str:
         lines.append(f"\nDeclared but not anonymously reachable ({len(graph.unreachable)}) — need a foothold:")
         for u in graph.unreachable:
             lines.append(f"  · {', '.join(u.usernames)} [{u.secret_id}]  unlocks: {', '.join(u.grants)}")
+    if graph.escalations:
+        lines.append(f"\nACL privilege escalations ({len(graph.escalations)}) — control extended via captured ACLs (advisory):")
+        for e in graph.escalations:
+            head = "‼ DOMAIN COMPROMISE" if e.domain_compromise else f"→ control {e.target}  [{e.right}]"
+            lines.append(f"\n  {head}")
+            for i, step in enumerate(e.steps):
+                lines.append(f"      {'└─' if i == len(e.steps) - 1 else '├─'} {step}")
     for n in graph.notes:
         lines.append(f"\nnote: {n}")
     return "\n".join(lines)
 
 
 __all__ = [
-    "AttackGraph", "ReachableCredential", "UnreachableCredential",
-    "annotate_live", "collapse_verdicts", "compose_paths", "format_graph",
+    "AclEscalation", "AttackGraph", "ReachableCredential", "UnreachableCredential",
+    "annotate_live", "collapse_verdicts", "compose_paths", "escalate_via_acls", "format_graph",
 ]

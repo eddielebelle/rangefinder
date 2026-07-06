@@ -200,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
         "paths", help="compose multi-hop credential attack paths across the estate twin")
     p_paths.add_argument("config", type=Path)
     p_paths.add_argument("--json", action="store_true", help="emit the attack graph as JSON")
+    p_paths.add_argument("--acl", action="store_true",
+                         help="extend reachable credentials through captured directory ACLs "
+                              "(GenericAll/WriteDacl/DCSync privilege escalation)")
     p_paths.add_argument("--verify", action="store_true",
                          help="probe each path edge against the live estate (needs --target), "
                               "promoting advisory paths to confirmed-live / refuted / untested")
@@ -656,7 +659,8 @@ def cmd_acl(args) -> int:
 def cmd_paths(args) -> int:
     import dataclasses
 
-    from rangefinder.paths import annotate_live, collapse_verdicts, compose_paths, format_graph
+    from rangefinder.paths import (
+        annotate_live, collapse_verdicts, compose_paths, escalate_via_acls, format_graph)
 
     try:
         cfg = load_config(args.config)
@@ -664,6 +668,8 @@ def cmd_paths(args) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_CONFIG
     graph = compose_paths(cfg)
+    if args.acl:
+        escalate_via_acls(graph, cfg)  # extend reachable creds through captured ACL control edges
 
     if args.verify:
         # Promote advisory edges to measured: probe each credential against the live estate (reusing
